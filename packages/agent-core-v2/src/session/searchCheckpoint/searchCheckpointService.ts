@@ -7,6 +7,10 @@ import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStor
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
 import {
+  checkpointChainTo,
+  recoverCheckpointTail,
+} from './checkpointRecovery';
+import {
   ISessionSearchCheckpointService,
   SEARCH_CHECKPOINT_PROTOCOL,
   type SearchCheckpoint,
@@ -71,12 +75,7 @@ export class SessionSearchCheckpointService
       });
       await this.appendLog.flush();
       if (appendError !== undefined) throw appendError;
-      const head: SearchCheckpointHead = {
-        protocol: SEARCH_CHECKPOINT_PROTOCOL,
-        checkpointId,
-        checkpointHash: checkpoint.checkpointHash,
-        sequence: input.createdAtSequence,
-      };
+      const head = headFor(checkpoint);
       await this.documents.set(this.scope, HEAD_KEY, head);
       this.checkpoints = [...this.checkpoints, checkpoint];
       this.currentHead = head;
@@ -93,30 +92,28 @@ export class SessionSearchCheckpointService
   ): Promise<SearchCheckpointRecovery<TState>> {
     return this.mutate(async () => {
       validateCompatibility(compatibility);
-      const ledgerHashes = await this.ledgerHashes();
-      const rejected: Array<{ checkpointId: string; reason: string }> = [];
-      let selected: SearchCheckpoint<TState> | undefined;
-      for (const checkpoint of [...this.checkpoints].reverse()) {
-        const reason = incompatibilityReason(checkpoint, compatibility, ledgerHashes);
-        if (reason === undefined) {
-          selected = checkpoint as SearchCheckpoint<TState>;
-          break;
-        }
-        rejected.push({ checkpointId: checkpoint.checkpointId, reason });
-      }
+      const durableLedgerHashes = await this.ledgerHashes();
+      const result = recoverCheckpointTail({
+        checkpoints: this.checkpoints,
+        requestedHeadHash: this.currentHead.checkpointHash ?? undefined,
+        durableLedgerHashes,
+        compatibility,
+      });
+      const selected = result.checkpoint as SearchCheckpoint<TState> | undefined;
       const recoveredFromPrior =
         selected !== undefined && selected.checkpointHash !== this.currentHead.checkpointHash;
       if (selected !== undefined && recoveredFromPrior) {
-        const head: SearchCheckpointHead = {
-          protocol: SEARCH_CHECKPOINT_PROTOCOL,
-          checkpointId: selected.checkpointId,
-          checkpointHash: selected.checkpointHash,
-          sequence: selected.createdAtSequence,
-        };
-        await this.documents.set(this.scope, HEAD_KEY, head);
-        this.currentHead = head;
+        this.checkpoints = [...checkpointChainTo(selected, this.checkpoints)];
+        this.currentHead = headFor(selected);
+        await this.documents.set(this.scope, HEAD_KEY, this.currentHead);
+        await this.recordRecovery(result.rejected, selected);
       }
-      return { checkpoint: selected, recoveredFromPrior, rejected };
+      return {
+        checkpoint: selected,
+        recoveredFromPrior,
+        exactRequestedHead: result.exactRequestedHead,
+        rejected: result.rejected,
+      };
     });
   }
 
@@ -133,45 +130,73 @@ export class SessionSearchCheckpointService
   private async restore(): Promise<void> {
     await this.ledger.ready();
     const checkpoints: SearchCheckpoint[] = [];
-    let previousHash: string | null = null;
     for await (const checkpoint of this.appendLog.read<SearchCheckpoint>(
       this.scope,
       LOG_KEY,
     )) {
-      validateCheckpoint(checkpoint);
-      if (checkpoint.previousCheckpointHash !== previousHash) {
-        throw new Error(
-          `Search checkpoint chain mismatch at ${checkpoint.checkpointId}.`,
-        );
-      }
       checkpoints.push(deepFreeze(structuredClone(checkpoint)));
-      previousHash = checkpoint.checkpointHash;
     }
+
     const persistedHead = await this.documents.get<SearchCheckpointHead>(
       this.scope,
       HEAD_KEY,
     );
-    if (persistedHead !== undefined) validateHead(persistedHead);
-    const last = checkpoints.at(-1);
-    const expectedHead: SearchCheckpointHead = last === undefined
-      ? emptyHead()
-      : {
-          protocol: SEARCH_CHECKPOINT_PROTOCOL,
-          checkpointId: last.checkpointId,
-          checkpointHash: last.checkpointHash,
-          sequence: last.createdAtSequence,
-        };
-    if (
-      persistedHead !== undefined &&
-      (
-        persistedHead.checkpointHash !== expectedHead.checkpointHash ||
-        persistedHead.checkpointId !== expectedHead.checkpointId
-      )
-    ) {
-      throw new Error('Search checkpoint atomic head does not match the append log.');
+    const requestedHeadHash = validHeadOrUndefined(persistedHead)?.checkpointHash ?? undefined;
+    const durableLedgerHashes = await this.ledgerHashes();
+
+    if (checkpoints.length === 0) {
+      this.checkpoints = [];
+      this.currentHead = emptyHead();
+      if (persistedHead !== undefined) {
+        await this.documents.set(this.scope, HEAD_KEY, this.currentHead);
+      }
+      return;
     }
-    this.checkpoints = checkpoints;
-    this.currentHead = expectedHead;
+
+    const structuralCompatibility: SearchCheckpointCompatibility = {
+      architectureVersion: newestStructurallyValid(checkpoints)?.architectureVersion ?? '',
+      protocolVersions: newestStructurallyValid(checkpoints)?.protocolVersions ?? {},
+    };
+    const result = recoverCheckpointTail({
+      checkpoints,
+      requestedHeadHash,
+      durableLedgerHashes,
+      compatibility: structuralCompatibility,
+    });
+    const selected = result.checkpoint;
+    if (selected === undefined) {
+      const details = result.rejected
+        .map((entry) => `${entry.checkpointId}:${entry.reason}`)
+        .join(', ');
+      throw new Error(`No durable search checkpoint could be recovered: ${details}`);
+    }
+
+    this.checkpoints = [...checkpointChainTo(selected, checkpoints)];
+    this.currentHead = headFor(selected);
+    const headChanged =
+      persistedHead?.checkpointHash !== this.currentHead.checkpointHash ||
+      persistedHead?.checkpointId !== this.currentHead.checkpointId;
+    if (headChanged) {
+      await this.documents.set(this.scope, HEAD_KEY, this.currentHead);
+    }
+    if (result.rejected.length > 0 || headChanged) {
+      await this.recordRecovery(result.rejected, selected);
+    }
+  }
+
+  private async recordRecovery(
+    rejected: SearchCheckpointRecovery['rejected'],
+    selected: SearchCheckpoint,
+  ): Promise<void> {
+    await this.ledger.append({
+      recordType: 'search.checkpoint.recovered',
+      payload: {
+        selectedCheckpointId: selected.checkpointId,
+        selectedCheckpointHash: selected.checkpointHash,
+        selectedSequence: selected.createdAtSequence,
+        rejected,
+      },
+    });
   }
 
   private async assertLedgerHeadExists(recordHash: string): Promise<void> {
@@ -204,27 +229,19 @@ export class SessionSearchCheckpointService
   }
 }
 
-function incompatibilityReason(
-  checkpoint: SearchCheckpoint,
-  compatibility: SearchCheckpointCompatibility,
-  ledgerHashes: ReadonlySet<string>,
-): string | undefined {
-  if (checkpoint.architectureVersion !== compatibility.architectureVersion) {
-    return `architecture ${checkpoint.architectureVersion} is incompatible with ${compatibility.architectureVersion}`;
-  }
-  const keys = new Set([
-    ...Object.keys(checkpoint.protocolVersions),
-    ...Object.keys(compatibility.protocolVersions),
-  ]);
-  for (const key of [...keys].sort()) {
-    if (checkpoint.protocolVersions[key] !== compatibility.protocolVersions[key]) {
-      return `protocol ${key} differs: ${String(checkpoint.protocolVersions[key])} != ${String(compatibility.protocolVersions[key])}`;
-    }
-  }
-  if (!ledgerHashes.has(checkpoint.ledgerHeadHash)) {
-    return `ledger head is unavailable: ${checkpoint.ledgerHeadHash}`;
-  }
-  return undefined;
+function newestStructurallyValid(
+  checkpoints: readonly SearchCheckpoint[],
+): SearchCheckpoint | undefined {
+  return [...checkpoints]
+    .filter((checkpoint) => {
+      try {
+        validateCheckpoint(checkpoint);
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .sort((left, right) => right.createdAtSequence - left.createdAtSequence)[0];
 }
 
 function validateCheckpoint(checkpoint: SearchCheckpoint): void {
@@ -253,6 +270,15 @@ function validateInput(input: SearchCheckpointInput): void {
   }
   if (input.reason.trim().length === 0) {
     throw new Error('Search checkpoint reason cannot be empty.');
+  }
+  if (input.configHash !== undefined && input.configHash.trim().length === 0) {
+    throw new Error('Search checkpoint configHash cannot be empty when provided.');
+  }
+  if (
+    input.workspaceSnapshotHash !== undefined &&
+    input.workspaceSnapshotHash.trim().length === 0
+  ) {
+    throw new Error('Search checkpoint workspaceSnapshotHash cannot be empty when provided.');
   }
   if (
     !Number.isFinite(input.frontierTemperature) ||
@@ -284,6 +310,27 @@ function validateCompatibility(compatibility: SearchCheckpointCompatibility): vo
   if (compatibility.architectureVersion.trim().length === 0) {
     throw new Error('Checkpoint compatibility architectureVersion cannot be empty.');
   }
+  if (compatibility.configHash !== undefined && compatibility.configHash.trim().length === 0) {
+    throw new Error('Checkpoint compatibility configHash cannot be empty when provided.');
+  }
+  if (
+    compatibility.workspaceSnapshotHash !== undefined &&
+    compatibility.workspaceSnapshotHash.trim().length === 0
+  ) {
+    throw new Error('Checkpoint compatibility workspaceSnapshotHash cannot be empty when provided.');
+  }
+}
+
+function validHeadOrUndefined(
+  head: SearchCheckpointHead | undefined,
+): SearchCheckpointHead | undefined {
+  if (head === undefined) return undefined;
+  try {
+    validateHead(head);
+    return head;
+  } catch {
+    return undefined;
+  }
 }
 
 function validateHead(head: SearchCheckpointHead): void {
@@ -296,6 +343,15 @@ function validateHead(head: SearchCheckpointHead): void {
   if ((head.checkpointId === null) !== (head.checkpointHash === null)) {
     throw new Error('Search checkpoint head ID and hash must both be null or non-null.');
   }
+}
+
+function headFor(checkpoint: SearchCheckpoint): SearchCheckpointHead {
+  return {
+    protocol: SEARCH_CHECKPOINT_PROTOCOL,
+    checkpointId: checkpoint.checkpointId,
+    checkpointHash: checkpoint.checkpointHash,
+    sequence: checkpoint.createdAtSequence,
+  };
 }
 
 function emptyHead(): SearchCheckpointHead {
