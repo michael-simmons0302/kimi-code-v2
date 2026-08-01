@@ -2,12 +2,9 @@ import { createDecorator } from '#/_base/di/instantiation';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { defineState } from '#/_base/state/stateRegistry';
-import { abortError } from '#/_base/utils/abort';
 import { IAgentAdaptiveMemoryService } from '#/agent/adaptiveMemory/adaptiveMemory';
 import { IAgentAdaptiveDirectiveService } from '#/agent/adaptivePrompt/adaptiveDirectiveService';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
-import { IAgentLoopService } from '#/agent/loop/loop';
-import { ContinuationStepRequest } from '#/agent/loop/stepRequest';
 import { IAgentStateService } from '#/agent/state/agentState';
 import { createEvidenceId } from './adaptiveProtocol';
 import { IAgentAdaptiveRuntimeService } from './adaptiveRuntime';
@@ -22,8 +19,6 @@ import { ISessionCandidateWorkspaceService } from '#/session/candidateWorkspace/
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
 import { ISessionStructuralSignalsService } from '#/session/structuralSignals/structuralSignals';
 
-const PREPARE_PRIORITY = -999_999;
-const VERIFY_PRIORITY = 2_000_000;
 const MAXIMUM_FINAL_RESPONSE_TOKENS = 400;
 
 interface AdaptiveFinalResponseGateState {
@@ -35,8 +30,16 @@ export const adaptiveFinalResponseGateStateKey = defineState<AdaptiveFinalRespon
   () => ({ correctionAttempts: 0 }),
 );
 
+export type AdaptiveFinalResponseDecision =
+  | { readonly kind: 'not-applicable' }
+  | { readonly kind: 'verified'; readonly verification: FinalResponseVerification }
+  | { readonly kind: 'correction-required'; readonly verification: FinalResponseVerification }
+  | { readonly kind: 'rejected'; readonly verification: FinalResponseVerification };
+
 export interface IAgentAdaptiveFinalResponseGateService {
   readonly _serviceBrand: undefined;
+  allowCoordinatorPreparation(): boolean;
+  verifyAfterStep(): Promise<AdaptiveFinalResponseDecision>;
 }
 
 export const IAgentAdaptiveFinalResponseGateService =
@@ -51,7 +54,6 @@ export class AgentAdaptiveFinalResponseGateService
   declare readonly _serviceBrand: undefined;
 
   constructor(
-    @IAgentLoopService loop: IAgentLoopService,
     @IAgentAdaptiveRuntimeService private readonly runtime: IAgentAdaptiveRuntimeService,
     @IAgentAdaptiveDirectiveService private readonly directive: IAgentAdaptiveDirectiveService,
     @IAgentAdaptiveMemoryService private readonly memory: IAgentAdaptiveMemoryService,
@@ -64,68 +66,48 @@ export class AgentAdaptiveFinalResponseGateService
   ) {
     super();
     states.register(adaptiveFinalResponseGateStateKey);
-    this._register(
-      loop.hooks.onWillBeginStep.register(
-        'adaptive-final-response-prepare',
-        async (_context, next) => {
-          if (!runtime.enabled() || runtime.phase() !== 'committing') {
-            await next();
-          }
-        },
-        { priority: PREPARE_PRIORITY },
-      ),
-    );
-    this._register(
-      loop.hooks.onDidFinishStep.register(
-        'adaptive-final-response-verify',
-        async (context, next) => {
-          if (!runtime.enabled() || runtime.phase() !== 'committing') {
-            await next();
-            return;
-          }
-          try {
-            const plan = await this.buildPlan();
-            const verification = await verifier.verify(this.latestAssistantText(), plan);
-            await this.recordVerification(verification, plan);
-            if (verification.valid) {
-              this.state = { correctionAttempts: 0 };
-              await next();
-              return;
-            }
-            if (this.state.correctionAttempts === 0) {
-              this.state = { correctionAttempts: 1 };
-              directive.set(correctionDirective(verification));
-              loop.enqueue(
-                new ContinuationStepRequest({
-                  kind: 'adaptive.final-response-correction',
-                  admission: 'activeTurnOnly',
-                  mergeable: false,
-                  turnScoped: true,
-                }),
-              );
-              return;
-            }
-            runtime.fail(
-              'commit-rejected',
-              `Final response verification failed after one correction: ${verificationSummary(verification)}`,
-            );
-            directive.set(undefined);
-            context.stopTurn = true;
-          } catch (error) {
-            runtime.fail(
-              'infrastructure-failed',
-              error instanceof Error ? error.message : String(error),
-            );
-            throw abortError(
-              `Final response verification failed closed: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-          }
-        },
-        { priority: VERIFY_PRIORITY },
-      ),
-    );
+  }
+
+  allowCoordinatorPreparation(): boolean {
+    return !this.runtime.enabled() || this.runtime.phase() !== 'committing';
+  }
+
+  async verifyAfterStep(): Promise<AdaptiveFinalResponseDecision> {
+    if (!this.runtime.enabled() || this.runtime.phase() !== 'committing') {
+      return { kind: 'not-applicable' };
+    }
+    try {
+      const plan = await this.buildPlan();
+      const verification = await this.verifier.verify(this.latestAssistantText(), plan);
+      await this.recordVerification(verification, plan);
+      if (verification.valid) {
+        this.state = { correctionAttempts: 0 };
+        this.directive.set(undefined);
+        return { kind: 'verified', verification };
+      }
+      if (this.state.correctionAttempts === 0) {
+        this.state = { correctionAttempts: 1 };
+        this.directive.set(correctionDirective(verification));
+        return { kind: 'correction-required', verification };
+      }
+      this.runtime.fail(
+        'commit-rejected',
+        `Final response verification failed after one correction: ${verificationSummary(verification)}`,
+      );
+      this.directive.set(undefined);
+      return { kind: 'rejected', verification };
+    } catch (error) {
+      this.runtime.fail(
+        'infrastructure-failed',
+        error instanceof Error ? error.message : String(error),
+      );
+      throw new Error(
+        `Final response verification failed closed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { cause: error },
+      );
+    }
   }
 
   private get state(): AdaptiveFinalResponseGateState {
