@@ -19,6 +19,7 @@ import {
 import { IAgentWorldModelService, type WorldModelCandidate } from '#/agent/worldModel/worldModel';
 import {
   DEFAULT_ADAPTIVE_BUDGET,
+  EVALUATION_SPEC_PROTOCOL,
   createEvaluationId,
   createEvidenceId,
   type CandidateId,
@@ -147,7 +148,6 @@ export class AgentAdaptiveCoordinatorService
       await this.initialize(step.signal);
       this.state = { ...this.state, initialized: true };
     }
-
     await this.planUntilExternalAction(step.signal);
   }
 
@@ -159,10 +159,13 @@ export class AgentAdaptiveCoordinatorService
       return { stopTurn: true, continueTurn: false };
     }
 
-    this.runtime.transition(
-      'reconciling',
-      'Reconciling the observed step outcome with the causal models.',
-    );
+    const finalResponseStep = this.runtime.phase() === 'committing';
+    if (!finalResponseStep) {
+      this.runtime.transition(
+        'reconciling',
+        'Reconciling the observed step outcome with the causal models.',
+      );
+    }
 
     const previousBaseline = this.workspaces.baseline();
     const reconciliation =
@@ -190,6 +193,7 @@ export class AgentAdaptiveCoordinatorService
         previousBaselineHash: previousBaseline?.hash,
         baselineHash: baseline.hash,
         reconciliation,
+        finalResponseStep,
         ledgerHead: this.ledger.head().recordHash,
       },
     });
@@ -220,35 +224,45 @@ export class AgentAdaptiveCoordinatorService
           this.state.verifiedCandidates > 0
             ? `${String(this.state.verifiedCandidates)} verification result(s) currently pass.`
             : 'No commit-eligible verification result exists yet.',
-        remainingDecision: 'Determine whether hard gates pass or another action is required.',
+        remainingDecision: finalResponseStep
+          ? 'Verify that the final response remains supported by the committed evidence.'
+          : 'Determine whether hard gates pass or another action is required.',
       },
     });
 
-    if (reconciliation?.unchanged === false || step.finishReason !== 'tool_calls') {
+    if (
+      !finalResponseStep &&
+      (reconciliation?.unchanged === false || step.finishReason !== 'tool_calls')
+    ) {
       await this.verifyCurrentWorkspace(step.signal);
     }
 
-    const blockingConflicts = this.signals
-      .conflicts('open')
-      .filter((conflict) => conflict.severity === 'commit-blocking').length;
-    const entropy = this.runtime.status()?.normalizedPosteriorEntropy ?? 1;
-    const liveWorkspaceReconciled =
-      reconciliation === undefined || reconciliation.conflictedPaths.length === 0;
     const assessment = this.search.assessCommit({
       hardGatesPass: this.state.verifiedCandidates > 0,
-      commitBlockingConflicts: blockingConflicts,
+      commitBlockingConflicts: this.signals
+        .conflicts('open')
+        .filter((conflict) => conflict.severity === 'commit-blocking').length,
       actionStableAcrossModels:
-        entropy <= 0.25 || this.worldModels.activeCandidates().length <= 1,
+        (this.runtime.status()?.normalizedPosteriorEntropy ?? 1) <= 0.25 ||
+        this.worldModels.activeCandidates().length <= 1,
       expectedAdditionalInformationValue:
-        this.runtime.status()?.decisionWeightedUncertainty ?? entropy,
+        this.runtime.status()?.decisionWeightedUncertainty ?? 1,
       expectedAdditionalCost: 0.1,
-      liveWorkspaceReconciled,
+      liveWorkspaceReconciled:
+        reconciliation === undefined || reconciliation.conflictedPaths.length === 0,
       claimsSupported: this.state.verifiedCandidates > 0,
     });
 
-    if (step.finishReason !== 'tool_calls' && assessment.eligible) {
-      this.runtime.transition('committing', 'All commit gates passed.');
-      await this.search.checkpoint();
+    if (finalResponseStep) {
+      if (!assessment.eligible) {
+        this.runtime.fail(
+          'commit-rejected',
+          assessment.reasons.join('; ') || 'Final commit gates did not pass.',
+        );
+        this.directive.set(undefined);
+        await this.flush();
+        return { stopTurn: true, continueTurn: false };
+      }
       await this.ledger.append({
         recordType: 'solution.commit.selected',
         adaptiveRunId: this.runtime.runId(),
@@ -257,12 +271,22 @@ export class AgentAdaptiveCoordinatorService
           selection: this.state.lastSelection,
           baselineHash: baseline.hash,
           structureHash: structure.hash,
+          finalResponseStep: true,
         },
       });
-      this.runtime.complete('Verified solution committed.');
+      this.runtime.complete('Verified solution and final response committed.');
       this.directive.set(undefined);
       await this.flush();
       return { stopTurn: true, continueTurn: false };
+    }
+
+    if (step.finishReason !== 'tool_calls' && assessment.eligible) {
+      this.runtime.transition('committing', 'All commit gates passed.');
+      await this.search.checkpoint();
+      this.directive.set(
+        'Return only the completed change, decisive verification, and unresolved material risk. Omit investigation history and unsupported claims.',
+      );
+      return { stopTurn: false, continueTurn: true };
     }
 
     if (this.state.continuationCount >= MAX_ADAPTIVE_CONTINUATIONS) {
@@ -306,7 +330,8 @@ export class AgentAdaptiveCoordinatorService
       'indexing',
       'Capturing the workspace and building the structural graph.',
     );
-    const baseline = this.workspaces.baseline() ?? (await this.workspaces.captureBaseline(signal));
+    const baseline =
+      this.workspaces.baseline() ?? (await this.workspaces.captureBaseline(signal));
     await this.ledger.append({ recordType: 'baseline.captured', payload: baseline });
     const structure = this.structure.snapshot() ?? (await this.structure.rebuild(signal));
     this.runtime.transition('discovering', 'Deriving repository-scale causal invariants.');
@@ -317,84 +342,82 @@ export class AgentAdaptiveCoordinatorService
 
   private async seedRepositoryRules(structureHash: string): Promise<void> {
     if (this.rules.list().length > 0) return;
-    const snapshot = this.structure.snapshot();
-    const nodes = snapshot?.nodes ?? [];
+    const nodes = this.structure.snapshot()?.nodes ?? [];
     const evidence = [`structure:${structureHash}`];
-    const publicSubjects = nodes
-      .filter((node) =>
-        ['interface', 'type', 'service-registration', 'tool-registration'].includes(
-          node.kind,
-        ),
-      )
-      .map((node) => node.id);
-    const persistenceSubjects = nodes
-      .filter((node) =>
-        ['wire-model', 'wire-operation', 'persistence-schema'].includes(node.kind),
-      )
-      .map((node) => node.id);
-    const eventSubjects = nodes
-      .filter((node) =>
-        ['event-type', 'event-publisher', 'event-subscriber'].includes(node.kind),
-      )
-      .map((node) => node.id);
-    const generatedSubjects = nodes
-      .filter((node) => node.kind === 'generated-artifact')
-      .map((node) => node.id);
+    await this.proposeRepositoryRule(
+      nodes
+        .filter((node) =>
+          ['interface', 'type', 'service-registration', 'tool-registration'].includes(
+            node.kind,
+          ),
+        )
+        .map((node) => node.id),
+      'change-public-contract',
+      [
+        { target: 'implementations', operation: 'invalidate' },
+        { target: 'callers', operation: 'invalidate' },
+        { target: 'tests', operation: 'invalidate' },
+      ],
+      evidence,
+      'repository',
+    );
+    await this.proposeRepositoryRule(
+      nodes
+        .filter((node) =>
+          ['wire-model', 'wire-operation', 'persistence-schema'].includes(node.kind),
+        )
+        .map((node) => node.id),
+      'change-persisted-contract',
+      [
+        { target: 'restore', operation: 'invalidate' },
+        { target: 'replay', operation: 'invalidate' },
+        { target: 'export', operation: 'invalidate' },
+      ],
+      evidence,
+      'repository',
+    );
+    await this.proposeRepositoryRule(
+      nodes
+        .filter((node) =>
+          ['event-type', 'event-publisher', 'event-subscriber'].includes(node.kind),
+        )
+        .map((node) => node.id),
+      'change-event-contract',
+      [
+        { target: 'publishers', operation: 'invalidate' },
+        { target: 'subscribers', operation: 'invalidate' },
+        { target: 'event-order', operation: 'invalidate' },
+      ],
+      evidence,
+      'runtime',
+    );
+    await this.proposeRepositoryRule(
+      nodes
+        .filter((node) => node.kind === 'generated-artifact')
+        .map((node) => node.id),
+      'change-generated-source',
+      [{ target: 'generated-artifacts', operation: 'invalidate' }],
+      evidence,
+      'repository',
+    );
+  }
 
-    if (publicSubjects.length > 0) {
-      await this.rules.propose({
-        scope: 'repository',
-        condition: { expression: { changedStructures: publicSubjects } },
-        intervention: { action: { type: 'change-public-contract' } },
-        predictedEffects: [
-          { target: 'implementations', operation: 'invalidate' },
-          { target: 'callers', operation: 'invalidate' },
-          { target: 'tests', operation: 'invalidate' },
-        ],
-        subjectRefs: publicSubjects,
-        supportingEvidenceRefs: evidence,
-      });
-    }
-    if (persistenceSubjects.length > 0) {
-      await this.rules.propose({
-        scope: 'repository',
-        condition: { expression: { changedStructures: persistenceSubjects } },
-        intervention: { action: { type: 'change-persisted-contract' } },
-        predictedEffects: [
-          { target: 'restore', operation: 'invalidate' },
-          { target: 'replay', operation: 'invalidate' },
-          { target: 'export', operation: 'invalidate' },
-        ],
-        subjectRefs: persistenceSubjects,
-        supportingEvidenceRefs: evidence,
-      });
-    }
-    if (eventSubjects.length > 0) {
-      await this.rules.propose({
-        scope: 'runtime',
-        condition: { expression: { changedStructures: eventSubjects } },
-        intervention: { action: { type: 'change-event-contract' } },
-        predictedEffects: [
-          { target: 'publishers', operation: 'invalidate' },
-          { target: 'subscribers', operation: 'invalidate' },
-          { target: 'event-order', operation: 'invalidate' },
-        ],
-        subjectRefs: eventSubjects,
-        supportingEvidenceRefs: evidence,
-      });
-    }
-    if (generatedSubjects.length > 0) {
-      await this.rules.propose({
-        scope: 'repository',
-        condition: { expression: { changedStructures: generatedSubjects } },
-        intervention: { action: { type: 'change-generated-source' } },
-        predictedEffects: [
-          { target: 'generated-artifacts', operation: 'invalidate' },
-        ],
-        subjectRefs: generatedSubjects,
-        supportingEvidenceRefs: evidence,
-      });
-    }
+  private async proposeRepositoryRule(
+    subjectRefs: readonly string[],
+    actionType: string,
+    predictedEffects: Parameters<IAgentCausalRuleGraphService['propose']>[0]['predictedEffects'],
+    supportingEvidenceRefs: readonly string[],
+    scope: 'repository' | 'runtime',
+  ): Promise<void> {
+    if (subjectRefs.length === 0) return;
+    await this.rules.propose({
+      scope,
+      condition: { expression: { changedStructures: subjectRefs } },
+      intervention: { action: { type: actionType } },
+      predictedEffects,
+      subjectRefs,
+      supportingEvidenceRefs,
+    });
   }
 
   private async ensureWorldModelPopulation(
@@ -403,7 +426,6 @@ export class AgentAdaptiveCoordinatorService
   ): Promise<void> {
     const active = this.worldModels.activeCandidates();
     if (!forceExpansion && active.length >= 3) return;
-    const objective = this.currentObjective();
     const kind =
       active.length === 0
         ? 'propose'
@@ -413,7 +435,7 @@ export class AgentAdaptiveCoordinatorService
     const proposed = await this.evolution.evolve(
       {
         kind,
-        objective,
+        objective: this.currentObjective(),
         observations: [this.structureSummary(), this.memorySummary()],
         counterexamples: this.worldModels.list('rejected').map((candidate) => ({
           candidateId: candidate.manifest.candidateId,
@@ -514,8 +536,7 @@ export class AgentAdaptiveCoordinatorService
     let nodeId = await this.search.begin(this.searchState());
     for (let index = 0; index < MAX_INTERNAL_ACTIONS_PER_STEP; index += 1) {
       signal.throwIfAborted();
-      const actions = await this.generateActions(signal);
-      await this.search.addActions(nodeId, actions);
+      await this.search.addActions(nodeId, await this.generateActions(signal));
       const selection = await this.search.select(nodeId);
       this.state = {
         ...this.state,
@@ -528,8 +549,7 @@ export class AgentAdaptiveCoordinatorService
       };
       switch (selection.action.kind) {
         case 'inspect-structure':
-          nodeId =
-            (await this.observeInternal(selection, 'inspected', 0.1)) ?? nodeId;
+          nodeId = (await this.observeInternal(selection, 'inspected', 0.1)) ?? nodeId;
           continue;
         case 'run-evaluation':
         case 'run-replicate':
@@ -547,8 +567,7 @@ export class AgentAdaptiveCoordinatorService
           continue;
         case 'construct-intervention':
         case 'simulate-task-action':
-          nodeId =
-            (await this.observeInternal(selection, 'simulated', 0.05)) ?? nodeId;
+          nodeId = (await this.observeInternal(selection, 'simulated', 0.05)) ?? nodeId;
           continue;
         case 'propose-task-patch':
         case 'execute-task-action':
@@ -663,25 +682,25 @@ export class AgentAdaptiveCoordinatorService
     action: SearchAction,
     signal: AbortSignal,
   ): Promise<SearchAction> {
-    const beliefState = this.worldModels.beliefState();
-    const weights = new Map(
-      beliefState.beliefs.map((belief) => [
-        belief.candidateId,
-        belief.normalizedWeight,
-      ]),
+    const beliefs = new Map(
+      this.worldModels
+        .beliefState()
+        .beliefs.map((belief) => [belief.candidateId, belief.normalizedWeight]),
     );
     const predictions: SearchOutcomePrediction[] = [];
     for (const candidate of this.worldModels.activeCandidates()) {
       try {
-        const observation = {
-          objective: this.currentObjective(),
-          structureHash: this.structure.snapshot()?.hash,
-          conflicts: this.signals.conflicts('open'),
-        };
         const state = await this.worldModels.invoke(
           candidate.manifest.candidateId,
           'encodeObservation',
-          [observation, { seed: action.actionId }],
+          [
+            {
+              objective: this.currentObjective(),
+              structureHash: this.structure.snapshot()?.hash,
+              conflicts: this.signals.conflicts('open'),
+            },
+            { seed: action.actionId },
+          ],
           { signal, timeoutMs: 5_000, seed: action.actionId },
         );
         const predicted = await this.worldModels.invoke<{
@@ -705,7 +724,7 @@ export class AgentAdaptiveCoordinatorService
         if (Object.keys(distribution).length === 0) distribution['unknown'] = 1;
         predictions.push({
           candidateId: candidate.manifest.candidateId,
-          modelWeight: weights.get(candidate.manifest.candidateId) ?? 0,
+          modelWeight: beliefs.get(candidate.manifest.candidateId) ?? 0,
           distribution,
         });
       } catch (error) {
@@ -752,7 +771,8 @@ export class AgentAdaptiveCoordinatorService
         ...this.state,
         evaluationsCompleted: this.state.evaluationsCompleted + 1,
         verifiedCandidates:
-          this.state.verifiedCandidates + (passed && selection.action.hardGate === true ? 1 : 0),
+          this.state.verifiedCandidates +
+          (passed && selection.action.hardGate === true ? 1 : 0),
       };
       this.runtime.update({
         evaluationsCompleted: this.state.evaluationsCompleted,
@@ -827,7 +847,7 @@ export class AgentAdaptiveCoordinatorService
   ): Promise<EvaluationResult> {
     return this.evaluation.evaluate(
       {
-        protocol: 'evaluation/1',
+        protocol: EVALUATION_SPEC_PROTOCOL,
         evaluationId: createEvaluationId(),
         adaptiveRunId: this.runtime.runId(),
         evaluatorId,
@@ -882,8 +902,7 @@ export class AgentAdaptiveCoordinatorService
         },
       ],
       exactDiagnostics: result.assertions
-        .filter((assertion) => assertion.message !== undefined)
-        .map((assertion) => assertion.message as string),
+        .flatMap((assertion) => (assertion.message === undefined ? [] : [assertion.message])),
       decisiveCounterexampleRefs:
         result.status === 'failed' ? ([evidenceId] as readonly EvidenceId[]) : [],
       artifactRefs: result.artifactRefs.map((artifact) => artifact.artifactId),
@@ -899,16 +918,12 @@ export class AgentAdaptiveCoordinatorService
   }
 
   private searchState(): SearchState {
-    const baseline = this.workspaces.baseline();
-    const structure = this.structure.snapshot();
-    const beliefs = this.worldModels.beliefState();
-    const conflicts = this.signals.conflicts('open');
     return {
-      workspaceSnapshotHash: baseline?.hash ?? 'uncaptured',
-      beliefStateHash: hashValue(beliefs),
+      workspaceSnapshotHash: this.workspaces.baseline()?.hash ?? 'uncaptured',
+      beliefStateHash: hashValue(this.worldModels.beliefState()),
       causalRuleGraphHash: this.rules.snapshot().hash,
-      structureIndexHash: structure?.hash ?? 'unindexed',
-      unresolvedConflictHash: hashValue(conflicts),
+      structureIndexHash: this.structure.snapshot()?.hash ?? 'unindexed',
+      unresolvedConflictHash: hashValue(this.signals.conflicts('open')),
       trajectorySummaryHash: hashValue(this.memorySummary()),
       verifiedCandidateIds:
         this.state.verifiedCandidates > 0 ? ['current-workspace'] : [],
@@ -918,9 +933,9 @@ export class AgentAdaptiveCoordinatorService
   }
 
   private currentObjective(): string {
-    const memorySummary = this.memorySummary();
-    const contextSummary = this.contextSummary();
-    const combined = [memorySummary, contextSummary].filter((value) => value.length > 0).join('\n');
+    const combined = [this.memorySummary(), this.contextSummary()]
+      .filter((value) => value.length > 0)
+      .join('\n');
     return combined.length === 0
       ? 'Complete the current coding task with verified repository-wide correctness.'
       : combined.slice(-16_000);
@@ -971,13 +986,7 @@ export class AgentAdaptiveCoordinatorService
     const nodeModules = `${root}/node_modules`;
     try {
       if (!(await lstat(nodeModules)).isDirectory()) return [];
-      return [
-        {
-          source: nodeModules,
-          target: '/workspace/node_modules',
-          writable: false,
-        },
-      ];
+      return [{ source: nodeModules, target: '/workspace/node_modules', writable: false }];
     } catch {
       return [];
     }
