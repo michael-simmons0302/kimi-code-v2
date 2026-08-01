@@ -11,6 +11,7 @@ import '#/agent/causalRuleGraph/causalRuleGraphService';
 import '#/agent/worldModel/worldModelService';
 import '#/agent/testTimeSearch/testTimeSearchService';
 import '#/session/evaluationLedger/evaluationLedgerService';
+import '#/session/evaluationLedger/evidenceGraphService';
 import '#/session/evaluation/evaluationRegistryService';
 import '#/session/evaluation/evaluationService';
 import '#/session/evaluation/processEvaluatorService';
