@@ -8,6 +8,8 @@ import {
   type EvaluationId,
   type EvaluationReplicateId,
 } from '#/agent/adaptiveRuntime/adaptiveProtocol';
+import type { EvaluationCacheIdentity } from './evaluationCache';
+import type { EvaluationEnvironmentManifest } from './environmentManifest';
 
 export type EvaluationMode = 'deterministic' | 'stochastic';
 export type EvaluationSoundness = 'sound' | 'empirical';
@@ -45,6 +47,12 @@ export interface EvaluationBudget {
   readonly maximumOutputBytes?: number;
 }
 
+export interface EvaluationCacheContext {
+  readonly identity: EvaluationCacheIdentity;
+  readonly environment: EvaluationEnvironmentManifest;
+  readonly createdAtSequence: number;
+}
+
 export interface EvaluationSpec<TInput = unknown> {
   readonly protocol: typeof EVALUATION_SPEC_PROTOCOL;
   readonly evaluationId: EvaluationId;
@@ -55,6 +63,7 @@ export interface EvaluationSpec<TInput = unknown> {
   readonly budget: EvaluationBudget;
   readonly seed?: string;
   readonly tags?: readonly string[];
+  readonly cache?: EvaluationCacheContext;
 }
 
 export interface EvaluationAssertionResult {
