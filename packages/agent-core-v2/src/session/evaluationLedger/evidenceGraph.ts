@@ -83,15 +83,19 @@ export interface ISessionEvidenceGraphService {
 
   ready(): Promise<void>;
   appendLink(input: AppendEvidenceLinkInput): Promise<EvidenceLink>;
-  getNode(evidenceId: EvidenceId): EvidenceNode | undefined;
-  linksFor(evidenceId: EvidenceId): readonly EvidenceLink[];
+  getNode(evidenceId: EvidenceId): Promise<EvidenceNode | undefined>;
+  linksFor(evidenceId: EvidenceId): Promise<readonly EvidenceLink[]>;
   traverse(
     evidenceId: EvidenceId,
     options?: EvidenceTraversalOptions,
-  ): readonly EvidenceNode[];
-  supportingEvidenceForClaim(claimEvidenceId: EvidenceId): readonly EvidenceNode[];
-  counterexamplesForRule(ruleEvidenceId: EvidenceId): readonly EvidenceNode[];
-  snapshot(): EvidenceGraphSnapshot;
+  ): Promise<readonly EvidenceNode[]>;
+  supportingEvidenceForClaim(
+    claimEvidenceId: EvidenceId,
+  ): Promise<readonly EvidenceNode[]>;
+  counterexamplesForRule(
+    ruleEvidenceId: EvidenceId,
+  ): Promise<readonly EvidenceNode[]>;
+  snapshot(): Promise<EvidenceGraphSnapshot>;
   flush(): Promise<void>;
 }
 
