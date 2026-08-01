@@ -24,6 +24,7 @@ import type {
   ISessionCandidateWorkspaceService,
 } from '#/session/candidateWorkspace/candidateWorkspace';
 import type {
+  AppendEvaluationLedgerInput,
   EvaluationLedgerHead,
   EvaluationLedgerRecord,
   ISessionEvaluationLedgerService,
@@ -72,18 +73,22 @@ class FakeVerifier implements IAgentFinalResponseVerifierService {
 
 class FakeLedger implements ISessionEvaluationLedgerService {
   declare readonly _serviceBrand: undefined;
-  readonly appended: unknown[] = [];
+  readonly appended: AppendEvaluationLedgerInput[] = [];
   constructor(private readonly baseline: BaselineSnapshot) {}
   async ready(): Promise<void> {}
-  async append<TPayload>(input: unknown): Promise<EvaluationLedgerRecord<TPayload>> {
-    this.appended.push(input);
+  async append<TPayload>(
+    input: AppendEvaluationLedgerInput<TPayload>,
+  ): Promise<EvaluationLedgerRecord<TPayload>> {
+    this.appended.push(input as AppendEvaluationLedgerInput);
     return {
       protocol: 'adaptive-ledger/1',
       sequence: this.appended.length + 1,
       previousRecordHash: 'previous',
       recordHash: 'hash',
-      recordType: 'final.claim.verified',
-      payload: input as TPayload,
+      recordType: input.recordType,
+      adaptiveRunId: input.adaptiveRunId,
+      evidenceId: input.evidenceId,
+      payload: input.payload,
     };
   }
   async *records(): AsyncIterable<EvaluationLedgerRecord> {
@@ -174,7 +179,7 @@ function fixture(results: FinalResponseVerification[]) {
     append: () => {},
     appendLoopEvent: () => {},
     clear: () => {},
-    undo: () => ({ removed: [], tokenCount: 0 }),
+    undo: () => ({ cutIndex: -1, removedCount: 0, stoppedAtCompaction: false }),
     applyCompaction: (input) => ({
       summary: input.summary,
       contextSummary: input.contextSummary ?? '',
@@ -220,7 +225,12 @@ function afterContext(): AfterStepContext {
     turnId: 1,
     step: 2,
     signal: new AbortController().signal,
-    usage: { inputTokens: 1, outputTokens: 1 },
+    usage: {
+      inputOther: 1,
+      output: 1,
+      inputCacheRead: 0,
+      inputCacheCreation: 0,
+    },
     finishReason: 'completed',
     stopTurn: false,
   };
