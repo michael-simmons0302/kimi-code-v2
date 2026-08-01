@@ -24,6 +24,7 @@ export interface ProcessEvidenceInput {
   readonly taskId?: string;
   readonly stdout: Uint8Array;
   readonly stderr: Uint8Array;
+  readonly combined?: Uint8Array;
   readonly modelOutputBytes?: number;
   readonly resourceUsage?: Readonly<{
     cpuUserMicros?: number;
@@ -73,7 +74,7 @@ export function createProcessEvidence(
   validateInput(input);
   const stdout = input.stdout.slice();
   const stderr = input.stderr.slice();
-  const combined = combineStreams(stdout, stderr);
+  const combined = input.combined?.slice() ?? combineStreams(stdout, stderr);
   const stdoutArtifact = artifact(stdout, 'stdout');
   const stderrArtifact = artifact(stderr, 'stderr');
   const combinedArtifact = artifact(combined, 'combined');
