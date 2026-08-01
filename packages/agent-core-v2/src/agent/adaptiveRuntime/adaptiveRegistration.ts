@@ -1,5 +1,6 @@
 import '#/agent/adaptiveRuntime/adaptiveRuntimeService';
 import '#/agent/adaptiveRuntime/adaptiveCoordinatorService';
+import '#/agent/adaptiveRuntime/adaptiveFinalResponseGateService';
 import '#/agent/adaptiveRuntime/adaptiveLoopBridgeService';
 import '#/agent/adaptiveRuntime/finalResponseVerifierService';
 import '#/agent/adaptivePrompt/adaptivePromptService';
