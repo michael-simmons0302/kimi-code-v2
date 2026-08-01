@@ -6,6 +6,7 @@
  * `--evolve` also requires v2, but it must not enable unrelated experiments.
  */
 
+import '@moonshot-ai/agent-core-v2/agent/adaptiveRuntime/adaptiveRegistration';
 import '@moonshot-ai/program-evolution/register';
 
 import type { CLIOptions } from './options';
