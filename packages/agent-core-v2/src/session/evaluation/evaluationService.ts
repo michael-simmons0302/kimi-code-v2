@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
-import { EVALUATION_PROTOCOL } from '#/agent/adaptiveRuntime/adaptiveProtocol';
+import { EVALUATION_RESULT_PROTOCOL } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
 import {
   ISessionEvaluationRegistry,
@@ -30,23 +30,29 @@ export class SessionEvaluationService
   ): Promise<EvaluationResult<TOutcome>> {
     await this.ledger.ready();
     const definition = this.registry.get(spec.evaluatorId);
-    if (spec.evaluatorVersion !== undefined && spec.evaluatorVersion !== definition.version) {
+    if (
+      spec.evaluatorVersion !== undefined &&
+      spec.evaluatorVersion !== definition.version
+    ) {
       throw new Error(
         `Evaluator version mismatch for ${spec.evaluatorId}: requested ${spec.evaluatorVersion}, registered ${definition.version}`,
       );
     }
 
-    const timeoutMs = positiveTimeout(spec.budget.timeoutMs, definition.defaultTimeoutMs);
+    const timeoutMs = positiveTimeout(
+      spec.budget.timeoutMs,
+      definition.defaultTimeoutMs,
+    );
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
-    const executionSignal = signal === undefined
-      ? timeoutSignal
-      : AbortSignal.any([signal, timeoutSignal]);
+    const executionSignal =
+      signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
     const startedAt = Date.now();
 
     await this.ledger.append({
       recordType: 'evaluation.started',
       adaptiveRunId: spec.adaptiveRunId,
       payload: {
+        protocol: spec.protocol,
         evaluationId: spec.evaluationId,
         evaluatorId: definition.evaluatorId,
         evaluatorVersion: definition.version,
@@ -62,11 +68,11 @@ export class SessionEvaluationService
 
     let result: EvaluationResult<TOutcome>;
     try {
-      const output = await definition.execute(spec.input, {
+      const output = (await definition.execute(spec.input, {
         signal: executionSignal,
         evaluationId: spec.evaluationId,
         seed: spec.seed,
-      }) as Omit<
+      })) as Omit<
         EvaluationResult<TOutcome>,
         | 'protocol'
         | 'evaluationId'
@@ -79,7 +85,7 @@ export class SessionEvaluationService
         | 'outcomeFamily'
       >;
       const base: EvaluationResult<TOutcome> = {
-        protocol: EVALUATION_PROTOCOL,
+        protocol: EVALUATION_RESULT_PROTOCOL,
         evaluationId: spec.evaluationId,
         evaluatorId: definition.evaluatorId,
         evaluatorVersion: definition.version,
@@ -99,7 +105,7 @@ export class SessionEvaluationService
       const cancelled = signal?.aborted === true;
       const timedOut = !cancelled && timeoutSignal.aborted;
       const base: EvaluationResult<TOutcome> = {
-        protocol: EVALUATION_PROTOCOL,
+        protocol: EVALUATION_RESULT_PROTOCOL,
         evaluationId: spec.evaluationId,
         evaluatorId: definition.evaluatorId,
         evaluatorVersion: definition.version,
@@ -114,7 +120,7 @@ export class SessionEvaluationService
         artifactRefs: [],
         cost: { wallMs: Date.now() - startedAt },
         infrastructureError: timedOut
-          ? `Evaluation timed out after ${timeoutMs}ms.`
+          ? `Evaluation timed out after ${String(timeoutMs)}ms.`
           : error instanceof Error
             ? error.message
             : String(error),
