@@ -50,7 +50,6 @@ export interface EvaluationBudget {
 export interface EvaluationCacheContext {
   readonly identity: EvaluationCacheIdentity;
   readonly environment: EvaluationEnvironmentManifest;
-  readonly createdAtSequence: number;
 }
 
 export interface EvaluationSpec<TInput = unknown> {
