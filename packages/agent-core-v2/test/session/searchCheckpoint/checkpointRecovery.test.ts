@@ -1,49 +1,48 @@
+import { createHash } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
 
 import {
   ADAPTIVE_ARCHITECTURE_VERSION,
   ADAPTIVE_PROTOCOL_REGISTRY,
-  type AdaptiveRunId,
-  type SearchEpisodeId,
 } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import {
   computeCheckpointHash,
   recoverCheckpointTail,
 } from '#/session/searchCheckpoint/checkpointRecovery';
 import type {
-  AdaptiveCheckpointCompatibility,
-  AdaptiveSearchCheckpoint,
+  SearchCheckpoint,
+  SearchCheckpointCompatibility,
 } from '#/session/searchCheckpoint/searchCheckpoint';
 
-const compatibility: AdaptiveCheckpointCompatibility = {
+const compatibility: SearchCheckpointCompatibility = {
   architectureVersion: ADAPTIVE_ARCHITECTURE_VERSION,
   protocolVersions: ADAPTIVE_PROTOCOL_REGISTRY,
   configHash: 'config',
   workspaceSnapshotHash: 'workspace',
 };
 
+function ledgerHash(sequence: number): string {
+  return createHash('sha256').update(`ledger-${String(sequence)}`).digest('hex');
+}
+
 function checkpoint(
   sequence: number,
   previousCheckpointHash: string | null,
-  overrides: Partial<AdaptiveSearchCheckpoint> = {},
-): AdaptiveSearchCheckpoint {
-  const content: Omit<AdaptiveSearchCheckpoint, 'checkpointHash'> = {
+  overrides: Partial<SearchCheckpoint> = {},
+): SearchCheckpoint {
+  const content: Omit<SearchCheckpoint, 'checkpointHash'> = {
     protocol: 'adaptive-search-checkpoint/1',
-    sequence,
+    checkpointId: `checkpoint-${String(sequence)}`,
     previousCheckpointHash,
-    createdAtMs: sequence * 1_000,
+    ledgerHeadHash: ledgerHash(sequence),
+    createdAtSequence: sequence,
     architectureVersion: ADAPTIVE_ARCHITECTURE_VERSION,
     protocolVersions: ADAPTIVE_PROTOCOL_REGISTRY,
     configHash: 'config',
     workspaceSnapshotHash: 'workspace',
-    adaptiveRunId: 'run' as AdaptiveRunId,
-    searchEpisodeId: 'episode' as SearchEpisodeId,
-    ledgerHead: {
-      protocol: 'adaptive-ledger/1',
-      sequence,
-      recordHash: `ledger-${String(sequence)}`,
-    },
-    remainingBudget: {
+    state: {},
+    budget: {
       maxInternalRequests: 1,
       maxEvaluations: 1,
       maxStochasticReplicates: 1,
@@ -55,7 +54,7 @@ function checkpoint(
       maxDiskBytes: 1,
       maxCandidates: 1,
     },
-    consumedCost: {
+    cost: {
       internalRequests: 0,
       evaluations: 0,
       stochasticReplicates: 0,
@@ -66,14 +65,18 @@ function checkpoint(
       cpuMs: 0,
       diskBytes: 0,
     },
-    randomGeneratorStates: {},
-    activeEvaluatorIds: [],
+    randomStates: [],
+    activeEvaluators: [],
     frontierTemperature: 0.75,
-    transpositionMetadata: {},
-    state: {},
+    transpositions: { entries: 0, hits: 0, evictions: 0, hash: 'empty' },
+    reason: 'test',
     ...overrides,
   };
   return { ...content, checkpointHash: computeCheckpointHash(content) };
+}
+
+function durable(...sequences: number[]): ReadonlySet<string> {
+  return new Set(sequences.map(ledgerHash));
 }
 
 describe('recoverCheckpointTail', () => {
@@ -83,7 +86,7 @@ describe('recoverCheckpointTail', () => {
     const result = recoverCheckpointTail({
       checkpoints: [first, second],
       requestedHeadHash: second.checkpointHash,
-      durableLedgerSequence: 2,
+      durableLedgerHashes: durable(1, 2),
       compatibility,
     });
     expect(result.checkpoint?.checkpointHash).toBe(second.checkpointHash);
@@ -97,7 +100,7 @@ describe('recoverCheckpointTail', () => {
     const result = recoverCheckpointTail({
       checkpoints: [first, corrupt],
       requestedHeadHash: corrupt.checkpointHash,
-      durableLedgerSequence: 2,
+      durableLedgerHashes: durable(1, 2),
       compatibility,
     });
     expect(result.checkpoint?.checkpointHash).toBe(first.checkpointHash);
@@ -111,7 +114,7 @@ describe('recoverCheckpointTail', () => {
     const orphan = checkpoint(2, 'missing-parent');
     const result = recoverCheckpointTail({
       checkpoints: [orphan],
-      durableLedgerSequence: 2,
+      durableLedgerHashes: durable(2),
       compatibility,
     });
     expect(result.checkpoint).toBeUndefined();
@@ -122,11 +125,11 @@ describe('recoverCheckpointTail', () => {
 
   it('rejects both branches of a fork and recovers the parent', () => {
     const root = checkpoint(1, null);
-    const left = checkpoint(2, root.checkpointHash, { createdAtMs: 2_000 });
-    const right = checkpoint(3, root.checkpointHash, { createdAtMs: 3_000 });
+    const left = checkpoint(2, root.checkpointHash);
+    const right = checkpoint(3, root.checkpointHash);
     const result = recoverCheckpointTail({
       checkpoints: [root, left, right],
-      durableLedgerSequence: 3,
+      durableLedgerHashes: durable(1, 2, 3),
       compatibility,
     });
     expect(result.checkpoint?.checkpointHash).toBe(root.checkpointHash);
@@ -134,15 +137,15 @@ describe('recoverCheckpointTail', () => {
   });
 
   it('rejects a chain whose parent sequence is not earlier', () => {
-    const parentContent = checkpoint(2, null);
-    const child = checkpoint(1, parentContent.checkpointHash);
+    const parent = checkpoint(2, null);
+    const child = checkpoint(1, parent.checkpointHash);
     const result = recoverCheckpointTail({
-      checkpoints: [parentContent, child],
+      checkpoints: [parent, child],
       requestedHeadHash: child.checkpointHash,
-      durableLedgerSequence: 2,
+      durableLedgerHashes: durable(1, 2),
       compatibility,
     });
-    expect(result.checkpoint?.checkpointHash).toBe(parentContent.checkpointHash);
+    expect(result.checkpoint?.checkpointHash).toBe(parent.checkpointHash);
     expect(result.rejected).toContainEqual(expect.objectContaining({ reason: 'cycle' }));
   });
 
@@ -151,7 +154,7 @@ describe('recoverCheckpointTail', () => {
     const second = checkpoint(2, first.checkpointHash);
     const result = recoverCheckpointTail({
       checkpoints: [first, second],
-      durableLedgerSequence: 1,
+      durableLedgerHashes: durable(1),
       compatibility,
     });
     expect(result.checkpoint?.checkpointHash).toBe(first.checkpointHash);
@@ -169,7 +172,7 @@ describe('recoverCheckpointTail', () => {
     const result = recoverCheckpointTail({
       checkpoints: [valid, changedConfig, changedWorkspace],
       requestedHeadHash: changedWorkspace.checkpointHash,
-      durableLedgerSequence: 3,
+      durableLedgerHashes: durable(1, 2, 3),
       compatibility,
     });
     expect(result.checkpoint?.checkpointHash).toBe(valid.checkpointHash);
