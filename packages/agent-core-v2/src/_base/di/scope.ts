@@ -32,6 +32,26 @@ export interface ScopedEntry {
 }
 
 const _scopedRegistry: ScopedEntry[] = [];
+const _registrationActivationOverrides: ScopeActivation[] = [];
+
+export async function withScopedRegistrationActivation<T>(
+  activation: ScopeActivation,
+  callback: () => T | Promise<T>,
+): Promise<T> {
+  _registrationActivationOverrides.push(activation);
+  try {
+    return await callback();
+  } finally {
+    const removed = _registrationActivationOverrides.pop();
+    if (removed !== activation) {
+      throw new Error('Scoped registration activation override stack was corrupted.');
+    }
+  }
+}
+
+function effectiveRegistrationActivation(requested: ScopeActivation): ScopeActivation {
+  return _registrationActivationOverrides.at(-1) ?? requested;
+}
 
 export function registerScopedService<T>(
   scope: LifecycleScope,
@@ -47,7 +67,7 @@ export function registerScopedService<T>(
     id: id as ServiceIdentifier<unknown>,
     descriptor: descriptor as SyncDescriptor<unknown>,
     domain,
-    activation,
+    activation: effectiveRegistrationActivation(activation),
   });
 }
 
@@ -57,6 +77,7 @@ export function getScopedServiceDescriptors(scope: LifecycleScope): ReadonlyArra
 
 export function _clearScopedRegistryForTests(): void {
   _scopedRegistry.length = 0;
+  _registrationActivationOverrides.length = 0;
 }
 
 export type ScopeSeed = ReadonlyArray<
