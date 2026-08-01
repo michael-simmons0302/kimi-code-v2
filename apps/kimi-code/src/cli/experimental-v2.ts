@@ -35,10 +35,14 @@ export function setKimiV2InvocationOverride(enabled: boolean): void {
 
 /** Load the trusted and mutable adaptive registrations before v2 scope creation. */
 export function loadAdaptiveRegistrations(): Promise<void> {
-  adaptiveRegistrations ??= Promise.all([
-    import('@moonshot-ai/agent-core-v2/agent/adaptiveRuntime/adaptiveRegistration'),
-    import('@moonshot-ai/program-evolution/register'),
-  ]).then(() => undefined);
+  adaptiveRegistrations ??= (async () => {
+    await import('@moonshot-ai/agent-core-v2/agent/adaptiveRuntime/adaptiveRegistration');
+    const { ScopeActivation, withScopedRegistrationActivation } =
+      await import('@moonshot-ai/agent-core-v2/_base/di/scope');
+    await withScopedRegistrationActivation(ScopeActivation.OnDemand, async () => {
+      await import('@moonshot-ai/program-evolution/register');
+    });
+  })();
   return adaptiveRegistrations;
 }
 
