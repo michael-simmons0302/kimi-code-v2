@@ -2,11 +2,42 @@ import { randomUUID } from 'node:crypto';
 
 export const ADAPTIVE_ARCHITECTURE_VERSION = 'evolve-architecture/1' as const;
 export const ADAPTIVE_LEDGER_PROTOCOL = 'adaptive-ledger/1' as const;
-export const EVALUATION_PROTOCOL = 'evaluation/1' as const;
+export const ADAPTIVE_EVIDENCE_GRAPH_PROTOCOL = 'adaptive-evidence-graph/1' as const;
+export const EVALUATION_SPEC_PROTOCOL = 'evaluation-spec/1' as const;
+export const EVALUATION_RESULT_PROTOCOL = 'evaluation-result/1' as const;
+export const CODE_STRUCTURE_GRAPH_PROTOCOL = 'code-structure-graph/1' as const;
+export const STRUCTURAL_SIGNALS_PROTOCOL = 'structural-signals/1' as const;
 export const CAUSAL_RULE_PROTOCOL = 'causal-rule/1' as const;
 export const WORLD_MODEL_PROTOCOL = 'world-model-module/1' as const;
+export const WORLD_MODEL_STORE_PROTOCOL = 'world-model-store/1' as const;
 export const SEARCH_CHECKPOINT_PROTOCOL = 'adaptive-search-checkpoint/1' as const;
 export const ADAPTIVE_PROMPT_PROTOCOL = 'adaptive-prompt/1' as const;
+export const CANDIDATE_WORKSPACE_PROTOCOL = 'candidate-workspace/1' as const;
+export const EVALUATION_SANDBOX_PROTOCOL = 'evaluation-sandbox/1' as const;
+export const PROGRAM_ARCHIVE_PROTOCOL = 'program-archive/1' as const;
+export const BENCHMARK_MANIFEST_PROTOCOL = 'evolve-benchmark-manifest/1' as const;
+
+/** @deprecated Use EVALUATION_SPEC_PROTOCOL or EVALUATION_RESULT_PROTOCOL. */
+export const EVALUATION_PROTOCOL = EVALUATION_SPEC_PROTOCOL;
+
+export const ADAPTIVE_PROTOCOL_REGISTRY = Object.freeze({
+  architecture: ADAPTIVE_ARCHITECTURE_VERSION,
+  evidenceLedger: ADAPTIVE_LEDGER_PROTOCOL,
+  evidenceGraph: ADAPTIVE_EVIDENCE_GRAPH_PROTOCOL,
+  evaluationSpec: EVALUATION_SPEC_PROTOCOL,
+  evaluationResult: EVALUATION_RESULT_PROTOCOL,
+  codeStructureGraph: CODE_STRUCTURE_GRAPH_PROTOCOL,
+  structuralSignals: STRUCTURAL_SIGNALS_PROTOCOL,
+  causalRule: CAUSAL_RULE_PROTOCOL,
+  worldModelModule: WORLD_MODEL_PROTOCOL,
+  worldModelStore: WORLD_MODEL_STORE_PROTOCOL,
+  searchCheckpoint: SEARCH_CHECKPOINT_PROTOCOL,
+  adaptivePrompt: ADAPTIVE_PROMPT_PROTOCOL,
+  candidateWorkspace: CANDIDATE_WORKSPACE_PROTOCOL,
+  evaluationSandbox: EVALUATION_SANDBOX_PROTOCOL,
+  programArchive: PROGRAM_ARCHIVE_PROTOCOL,
+  benchmarkManifest: BENCHMARK_MANIFEST_PROTOCOL,
+} as const);
 
 export type Brand<T, Name extends string> = T & { readonly __brand: Name };
 
