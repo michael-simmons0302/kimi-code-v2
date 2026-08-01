@@ -23,7 +23,10 @@ import {
 } from '@moonshot-ai/kimi-telemetry';
 
 import { createProgram } from './cli/commands';
-import { setKimiV2InvocationOverride } from './cli/experimental-v2';
+import {
+  loadAdaptiveRegistrations,
+  setKimiV2InvocationOverride,
+} from './cli/experimental-v2';
 import { finalizeHeadlessRun } from './cli/headless-exit';
 import type { CLIOptions } from './cli/options';
 import { OptionConflictError, validateOptions } from './cli/options';
@@ -60,6 +63,7 @@ export async function handleMainCommand(
   }
 
   setKimiV2InvocationOverride(validated.options.evolve);
+  if (validated.options.evolve) await loadAdaptiveRegistrations();
 
   const preflightResult = await runUpdatePreflight(
     version,
