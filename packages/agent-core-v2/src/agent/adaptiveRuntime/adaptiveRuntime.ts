@@ -1,6 +1,11 @@
-import { createDecorator } from '#/_base/di/instantiation';
+import {
+  createDecorator,
+  IInstantiationService,
+  type ServiceIdentifier,
+} from '#/_base/di/instantiation';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import type { AdaptivePromptPhase } from '#/agent/adaptivePrompt/adaptivePromptLibrary';
+import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import type {
   AdaptiveCost,
   AdaptivePhase,
@@ -37,33 +42,110 @@ export interface IAgentAdaptiveRuntimeService {
   update(update: AdaptiveCounterUpdate): void;
   status(): AdaptiveStatusSnapshot | undefined;
   complete(reason: string): void;
-  fail(phase: Extract<AdaptivePhase, 'blocked' | 'cancelled' | 'budget-exhausted' | 'infrastructure-failed' | 'evidence-corrupted' | 'no-viable-model' | 'commit-rejected'>, reason: string): void;
+  fail(
+    phase: Extract<
+      AdaptivePhase,
+      | 'blocked'
+      | 'cancelled'
+      | 'budget-exhausted'
+      | 'infrastructure-failed'
+      | 'evidence-corrupted'
+      | 'no-viable-model'
+      | 'commit-rejected'
+    >,
+    reason: string,
+  ): void;
 }
 
 export const IAgentAdaptiveRuntimeService = createDecorator<IAgentAdaptiveRuntimeService>(
   'agentAdaptiveRuntimeService',
 );
 
-/** Default binding used when the host did not load Evolve registrations. */
-export class DisabledAgentAdaptiveRuntimeService implements IAgentAdaptiveRuntimeService {
-  declare readonly _serviceBrand: undefined;
+export const IAgentAdaptiveRuntimeImplementation:
+  ServiceIdentifier<IAgentAdaptiveRuntimeService> =
+  createDecorator<IAgentAdaptiveRuntimeService>('agentAdaptiveRuntimeImplementation');
 
-  enabled(): boolean { return false; }
-  runId(): AdaptiveRunId | undefined { return undefined; }
-  ensureRun(): AdaptiveRunId | undefined { return undefined; }
-  phase(): AdaptivePhase { return 'inactive'; }
-  transition(): AdaptivePhaseTransition | undefined { return undefined; }
-  promptPhase(): AdaptivePromptPhase | undefined { return undefined; }
-  update(): void {}
-  status(): AdaptiveStatusSnapshot | undefined { return undefined; }
-  complete(): void {}
-  fail(): void {}
+/**
+ * Stable loop dependency. Disabled hosts observe a strict no-op runtime;
+ * enabled hosts lazily resolve the full implementation registered by Evolve.
+ */
+export class AgentAdaptiveRuntimeFacade implements IAgentAdaptiveRuntimeService {
+  declare readonly _serviceBrand: undefined;
+  private implementationValue: IAgentAdaptiveRuntimeService | undefined;
+
+  constructor(
+    @IBootstrapService private readonly bootstrap: IBootstrapService,
+    @IInstantiationService private readonly instantiation: IInstantiationService,
+  ) {}
+
+  enabled(): boolean {
+    return this.bootstrap.args.adaptiveMode === 'enabled';
+  }
+
+  runId(): AdaptiveRunId | undefined {
+    return this.implementation()?.runId();
+  }
+
+  ensureRun(): AdaptiveRunId | undefined {
+    return this.implementation()?.ensureRun();
+  }
+
+  phase(): AdaptivePhase {
+    return this.implementation()?.phase() ?? 'inactive';
+  }
+
+  transition(
+    to: AdaptivePhase,
+    reason: string,
+  ): AdaptivePhaseTransition | undefined {
+    return this.implementation()?.transition(to, reason);
+  }
+
+  promptPhase(): AdaptivePromptPhase | undefined {
+    return this.implementation()?.promptPhase();
+  }
+
+  update(update: AdaptiveCounterUpdate): void {
+    this.implementation()?.update(update);
+  }
+
+  status(): AdaptiveStatusSnapshot | undefined {
+    return this.implementation()?.status();
+  }
+
+  complete(reason: string): void {
+    this.implementation()?.complete(reason);
+  }
+
+  fail(
+    phase: Extract<
+      AdaptivePhase,
+      | 'blocked'
+      | 'cancelled'
+      | 'budget-exhausted'
+      | 'infrastructure-failed'
+      | 'evidence-corrupted'
+      | 'no-viable-model'
+      | 'commit-rejected'
+    >,
+    reason: string,
+  ): void {
+    this.implementation()?.fail(phase, reason);
+  }
+
+  private implementation(): IAgentAdaptiveRuntimeService | undefined {
+    if (!this.enabled()) return undefined;
+    this.implementationValue ??= this.instantiation.invokeFunction(
+      (accessor) => accessor.get(IAgentAdaptiveRuntimeImplementation),
+    );
+    return this.implementationValue;
+  }
 }
 
 registerScopedService(
   LifecycleScope.Agent,
   IAgentAdaptiveRuntimeService,
-  DisabledAgentAdaptiveRuntimeService,
+  AgentAdaptiveRuntimeFacade,
   ScopeActivation.OnDemand,
-  'adaptiveRuntimeDisabled',
+  'adaptiveRuntimeFacade',
 );
