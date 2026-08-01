@@ -5,7 +5,8 @@ import { IAgentStateService } from '#/agent/state/agentState';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IEventBus } from '#/app/event/eventBus';
 import {
-  IAgentAdaptiveRuntimeService,
+  IAgentAdaptiveRuntimeImplementation,
+  type IAgentAdaptiveRuntimeService,
   type AdaptiveCounterUpdate,
   type AdaptivePhaseTransition,
 } from './adaptiveRuntime';
@@ -218,8 +219,8 @@ export class AgentAdaptiveRuntimeService implements IAgentAdaptiveRuntimeService
 
 registerScopedService(
   LifecycleScope.Agent,
-  IAgentAdaptiveRuntimeService,
+  IAgentAdaptiveRuntimeImplementation,
   AgentAdaptiveRuntimeService,
-  ScopeActivation.OnScopeCreated,
-  'adaptiveRuntime',
+  ScopeActivation.OnDemand,
+  'adaptiveRuntimeImplementation',
 );
