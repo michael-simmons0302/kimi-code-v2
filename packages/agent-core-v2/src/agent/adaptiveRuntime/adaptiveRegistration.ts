@@ -2,6 +2,7 @@ import '#/agent/adaptiveRuntime/adaptiveRuntimeService';
 import '#/agent/adaptiveRuntime/adaptiveCoordinatorService';
 import '#/agent/adaptivePrompt/adaptivePromptService';
 import '#/agent/adaptivePrompt/adaptiveDirectiveService';
+import '#/agent/adaptiveMemory/adaptiveMemoryService';
 import '#/agent/evaluationEvidence/evaluationEvidenceService';
 import '#/agent/causalRuleGraph/causalRuleGraphService';
 import '#/agent/worldModel/worldModelService';
