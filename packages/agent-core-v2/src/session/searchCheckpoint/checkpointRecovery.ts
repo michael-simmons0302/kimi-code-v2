@@ -1,53 +1,46 @@
 import { createHash } from 'node:crypto';
 
-import { ADAPTIVE_PROTOCOL_REGISTRY } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import type {
-  AdaptiveCheckpointCompatibility,
-  AdaptiveSearchCheckpoint,
+  SearchCheckpoint,
+  SearchCheckpointCompatibility,
+  SearchCheckpointRejection,
+  SearchCheckpointRejectionReason,
 } from './searchCheckpoint';
 
 export interface RecoverCheckpointInput {
-  readonly checkpoints: readonly AdaptiveSearchCheckpoint[];
+  readonly checkpoints: readonly SearchCheckpoint[];
   readonly requestedHeadHash?: string;
-  readonly durableLedgerSequence: number;
-  readonly compatibility: AdaptiveCheckpointCompatibility;
-}
-
-export interface CheckpointRecoveryRejection {
-  readonly checkpointHash: string;
-  readonly reason:
-    | 'invalid-hash'
-    | 'duplicate-hash'
-    | 'missing-parent'
-    | 'forked-chain'
-    | 'cycle'
-    | 'ledger-ahead'
-    | 'incompatible';
-  readonly detail: string;
+  readonly durableLedgerHashes: ReadonlySet<string>;
+  readonly compatibility: SearchCheckpointCompatibility;
 }
 
 export interface RecoverCheckpointResult {
-  readonly checkpoint?: AdaptiveSearchCheckpoint;
-  readonly recoveredHeadHash?: string;
+  readonly checkpoint?: SearchCheckpoint;
   readonly exactRequestedHead: boolean;
-  readonly rejected: readonly CheckpointRecoveryRejection[];
+  readonly rejected: readonly SearchCheckpointRejection[];
 }
 
 export function recoverCheckpointTail(
   input: RecoverCheckpointInput,
 ): RecoverCheckpointResult {
-  if (!Number.isInteger(input.durableLedgerSequence) || input.durableLedgerSequence < 0) {
-    throw new Error('durableLedgerSequence must be a non-negative integer.');
-  }
-  const byHash = new Map<string, AdaptiveSearchCheckpoint>();
-  const rejected: CheckpointRecoveryRejection[] = [];
+  const byHash = new Map<string, SearchCheckpoint>();
+  const rejected: SearchCheckpointRejection[] = [];
+
   for (const checkpoint of input.checkpoints) {
     if (!verifyCheckpointHash(checkpoint)) {
-      rejected.push(rejection(checkpoint, 'invalid-hash', 'Checkpoint content does not match checkpointHash.'));
+      rejected.push(rejection(
+        checkpoint,
+        'invalid-hash',
+        'Checkpoint content does not match checkpointHash.',
+      ));
       continue;
     }
     if (byHash.has(checkpoint.checkpointHash)) {
-      rejected.push(rejection(checkpoint, 'duplicate-hash', 'The same checkpoint hash occurs more than once.'));
+      rejected.push(rejection(
+        checkpoint,
+        'duplicate-hash',
+        'The same checkpoint hash occurs more than once.',
+      ));
       continue;
     }
     byHash.set(checkpoint.checkpointHash, checkpoint);
@@ -58,7 +51,11 @@ export function recoverCheckpointTail(
     const parent = checkpoint.previousCheckpointHash;
     if (parent === null) continue;
     if (!byHash.has(parent)) {
-      rejected.push(rejection(checkpoint, 'missing-parent', `Missing parent checkpoint ${parent}.`));
+      rejected.push(rejection(
+        checkpoint,
+        'missing-parent',
+        `Missing parent checkpoint ${parent}.`,
+      ));
       continue;
     }
     const values = children.get(parent) ?? [];
@@ -69,12 +66,16 @@ export function recoverCheckpointTail(
     if (values.length <= 1) continue;
     for (const child of values) {
       const checkpoint = byHash.get(child)!;
-      rejected.push(rejection(checkpoint, 'forked-chain', `Checkpoint ${parent} has ${String(values.length)} children.`));
+      rejected.push(rejection(
+        checkpoint,
+        'forked-chain',
+        `Checkpoint ${parent} has ${String(values.length)} children.`,
+      ));
     }
   }
 
   const ordered = [...byHash.values()].sort((left, right) =>
-    right.sequence - left.sequence || right.createdAtMs - left.createdAtMs ||
+    right.createdAtSequence - left.createdAtSequence ||
     left.checkpointHash.localeCompare(right.checkpointHash),
   );
   const requested = input.requestedHeadHash === undefined
@@ -90,11 +91,11 @@ export function recoverCheckpointTail(
       rejected.push(rejection(checkpoint, chain.reason, chain.detail));
       continue;
     }
-    if (checkpoint.ledgerHead.sequence > input.durableLedgerSequence) {
+    if (!input.durableLedgerHashes.has(checkpoint.ledgerHeadHash)) {
       rejected.push(rejection(
         checkpoint,
         'ledger-ahead',
-        `Checkpoint ledger sequence ${String(checkpoint.ledgerHead.sequence)} exceeds durable sequence ${String(input.durableLedgerSequence)}.`,
+        `Checkpoint ledger head is not durable: ${checkpoint.ledgerHeadHash}.`,
       ));
       continue;
     }
@@ -105,33 +106,54 @@ export function recoverCheckpointTail(
     }
     return {
       checkpoint,
-      recoveredHeadHash: checkpoint.checkpointHash,
       exactRequestedHead:
         input.requestedHeadHash !== undefined &&
         checkpoint.checkpointHash === input.requestedHeadHash,
       rejected: deduplicateRejections(rejected),
     };
   }
+
   return {
     exactRequestedHead: false,
     rejected: deduplicateRejections(rejected),
   };
 }
 
+export function checkpointChainTo(
+  checkpoint: SearchCheckpoint,
+  checkpoints: readonly SearchCheckpoint[],
+): readonly SearchCheckpoint[] {
+  const byHash = new Map(checkpoints.map((value) => [value.checkpointHash, value]));
+  const chain: SearchCheckpoint[] = [];
+  const seen = new Set<string>();
+  let current: SearchCheckpoint | undefined = checkpoint;
+  while (current !== undefined) {
+    if (seen.has(current.checkpointHash)) {
+      throw new Error(`Checkpoint chain cycles at ${current.checkpointHash}.`);
+    }
+    seen.add(current.checkpointHash);
+    chain.push(current);
+    current = current.previousCheckpointHash === null
+      ? undefined
+      : byHash.get(current.previousCheckpointHash);
+  }
+  return chain.reverse();
+}
+
 export function computeCheckpointHash(
-  checkpoint: Omit<AdaptiveSearchCheckpoint, 'checkpointHash'>,
+  checkpoint: Omit<SearchCheckpoint, 'checkpointHash'>,
 ): string {
   return createHash('sha256').update(canonicalJson(checkpoint)).digest('hex');
 }
 
-export function verifyCheckpointHash(checkpoint: AdaptiveSearchCheckpoint): boolean {
+export function verifyCheckpointHash(checkpoint: SearchCheckpoint): boolean {
   const { checkpointHash: _checkpointHash, ...content } = checkpoint;
   return computeCheckpointHash(content) === checkpoint.checkpointHash;
 }
 
 function validateChain(
-  start: AdaptiveSearchCheckpoint,
-  byHash: ReadonlyMap<string, AdaptiveSearchCheckpoint>,
+  start: SearchCheckpoint,
+  byHash: ReadonlyMap<string, SearchCheckpoint>,
   children: ReadonlyMap<string, readonly string[]>,
 ):
   | { readonly valid: true }
@@ -141,7 +163,7 @@ function validateChain(
       readonly detail: string;
     } {
   const seen = new Set<string>();
-  let current: AdaptiveSearchCheckpoint | undefined = start;
+  let current: SearchCheckpoint | undefined = start;
   while (current !== undefined) {
     if (seen.has(current.checkpointHash)) {
       return {
@@ -169,11 +191,13 @@ function validateChain(
         detail: `Checkpoint ${current.checkpointHash} references missing parent ${parentHash}.`,
       };
     }
-    if (parent.sequence >= current.sequence) {
+    if (parent.createdAtSequence >= current.createdAtSequence) {
       return {
         valid: false,
         reason: 'cycle',
-        detail: `Parent sequence ${String(parent.sequence)} is not earlier than child sequence ${String(current.sequence)}.`,
+        detail:
+          `Parent sequence ${String(parent.createdAtSequence)} is not earlier than ` +
+          `child sequence ${String(current.createdAtSequence)}.`,
       };
     }
     current = parent;
@@ -182,45 +206,61 @@ function validateChain(
 }
 
 function incompatibilityReason(
-  checkpoint: AdaptiveSearchCheckpoint,
-  compatibility: AdaptiveCheckpointCompatibility,
+  checkpoint: SearchCheckpoint,
+  compatibility: SearchCheckpointCompatibility,
 ): string | undefined {
   if (checkpoint.protocol !== 'adaptive-search-checkpoint/1') {
     return `Unsupported checkpoint protocol ${String(checkpoint.protocol)}.`;
   }
   if (checkpoint.architectureVersion !== compatibility.architectureVersion) {
-    return `Architecture ${checkpoint.architectureVersion} does not match ${compatibility.architectureVersion}.`;
+    return (
+      `Architecture ${checkpoint.architectureVersion} does not match ` +
+      `${compatibility.architectureVersion}.`
+    );
   }
-  if (checkpoint.configHash !== compatibility.configHash) {
+  const keys = new Set([
+    ...Object.keys(checkpoint.protocolVersions),
+    ...Object.keys(compatibility.protocolVersions),
+  ]);
+  for (const key of [...keys].sort()) {
+    if (checkpoint.protocolVersions[key] !== compatibility.protocolVersions[key]) {
+      return (
+        `Protocol ${key} differs: ${String(checkpoint.protocolVersions[key])} != ` +
+        `${String(compatibility.protocolVersions[key])}.`
+      );
+    }
+  }
+  if (
+    compatibility.configHash !== undefined &&
+    checkpoint.configHash !== compatibility.configHash
+  ) {
     return 'Adaptive configuration hash changed.';
   }
-  if (checkpoint.workspaceSnapshotHash !== compatibility.workspaceSnapshotHash) {
+  if (
+    compatibility.workspaceSnapshotHash !== undefined &&
+    checkpoint.workspaceSnapshotHash !== compatibility.workspaceSnapshotHash
+  ) {
     return 'Workspace snapshot hash changed.';
-  }
-  for (const [name, version] of Object.entries(ADAPTIVE_PROTOCOL_REGISTRY)) {
-    const expected = compatibility.protocolVersions[name];
-    if (expected !== undefined && expected !== version) {
-      return `Runtime protocol registry is inconsistent for ${name}.`;
-    }
-    const persisted = checkpoint.protocolVersions[name];
-    if (persisted !== undefined && persisted !== version) {
-      return `Checkpoint protocol ${name}=${persisted} does not match ${version}.`;
-    }
   }
   return undefined;
 }
 
 function rejection(
-  checkpoint: AdaptiveSearchCheckpoint,
-  reason: CheckpointRecoveryRejection['reason'],
+  checkpoint: SearchCheckpoint,
+  reason: SearchCheckpointRejectionReason,
   detail: string,
-): CheckpointRecoveryRejection {
-  return { checkpointHash: checkpoint.checkpointHash, reason, detail };
+): SearchCheckpointRejection {
+  return {
+    checkpointId: checkpoint.checkpointId,
+    checkpointHash: checkpoint.checkpointHash,
+    reason,
+    detail,
+  };
 }
 
 function deduplicateRejections(
-  values: readonly CheckpointRecoveryRejection[],
-): readonly CheckpointRecoveryRejection[] {
+  values: readonly SearchCheckpointRejection[],
+): readonly SearchCheckpointRejection[] {
   const seen = new Set<string>();
   return values.filter((value) => {
     const key = `${value.checkpointHash}\u0000${value.reason}\u0000${value.detail}`;
