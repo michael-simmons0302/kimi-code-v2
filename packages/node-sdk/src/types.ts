@@ -73,6 +73,7 @@ export type { TelemetryClient, TelemetryContextPatch, TelemetryProperties };
 export type { ContentPart, Role, ThinkingEffort, ToolCall } from '@moonshot-ai/kosong';
 
 export type PermissionMode = 'yolo' | 'manual' | 'auto';
+export type AdaptiveHostMode = 'disabled' | 'enabled';
 
 /**
  * Trust state of a workspace directory. Only meaningful on the agent-core-v2
@@ -105,6 +106,8 @@ export interface KimiHarnessOptions {
   readonly telemetry?: TelemetryClient | undefined;
   readonly onOAuthRefresh?: ((outcome: OAuthRefreshOutcome) => void) | undefined;
   readonly sessionStartedProperties?: TelemetryProperties;
+  /** Invocation-scoped v2 adaptive execution mode. Ignored by the v1 engine. */
+  readonly adaptiveMode?: AdaptiveHostMode;
 }
 
 export interface CreateSessionOptions {
