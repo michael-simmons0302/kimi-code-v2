@@ -7,6 +7,7 @@ import {
   type AdaptiveRunId,
   type EvaluationId,
   type EvaluationReplicateId,
+  type EvidenceId,
 } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import type { EvaluationCacheIdentity } from './evaluationCache';
 import type { EvaluationEnvironmentManifest } from './environmentManifest';
@@ -63,6 +64,7 @@ export interface EvaluationSpec<TInput = unknown> {
   readonly seed?: string;
   readonly tags?: readonly string[];
   readonly cache?: EvaluationCacheContext;
+  readonly inputEvidenceRefs?: readonly EvidenceId[];
 }
 
 export interface EvaluationAssertionResult {
@@ -93,6 +95,7 @@ export interface EvaluationCost {
 export interface EvaluationResult<TOutcome = unknown> {
   readonly protocol: typeof EVALUATION_RESULT_PROTOCOL;
   readonly evaluationId: EvaluationId;
+  readonly evidenceId?: EvidenceId;
   readonly evaluatorId: string;
   readonly evaluatorVersion: string;
   readonly mode: EvaluationMode;
@@ -141,6 +144,7 @@ export interface EvaluatorDefinition<TInput = unknown, TOutcome = unknown> {
       EvaluationResult<TOutcome>,
       | 'protocol'
       | 'evaluationId'
+      | 'evidenceId'
       | 'evaluatorId'
       | 'evaluatorVersion'
       | 'mode'
