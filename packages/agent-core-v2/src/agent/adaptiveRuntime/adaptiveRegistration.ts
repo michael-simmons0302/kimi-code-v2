@@ -1,13 +1,19 @@
 import '#/agent/adaptiveRuntime/adaptiveRuntimeService';
+import '#/agent/adaptiveRuntime/adaptiveCoordinatorService';
 import '#/agent/adaptivePrompt/adaptivePromptService';
+import '#/agent/adaptivePrompt/adaptiveDirectiveService';
 import '#/agent/evaluationEvidence/evaluationEvidenceService';
 import '#/agent/causalRuleGraph/causalRuleGraphService';
 import '#/agent/worldModel/worldModelService';
+import '#/agent/testTimeSearch/testTimeSearchService';
 import '#/session/evaluationLedger/evaluationLedgerService';
 import '#/session/evaluation/evaluationRegistryService';
 import '#/session/evaluation/evaluationService';
 import '#/session/evaluation/processEvaluatorService';
+import '#/session/evaluation/sandboxCommandEvaluatorService';
 import '#/session/codeStructure/codeStructureService';
 import '#/session/structuralSignals/structuralSignalsService';
+import '#/session/candidateWorkspace/candidateWorkspaceService';
+import '#/session/evaluationSandbox/evaluationSandboxService';
 
 export {};
