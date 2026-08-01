@@ -1,6 +1,9 @@
+import { StringDecoder } from 'node:string_decoder';
 import type { Readable } from 'node:stream';
 
+import type { ProcessEvidenceRecorder } from '#/agent/evaluationEvidence/processEvidenceRecorderService';
 import type { IProcess } from '#/session/process/processRunner';
+import type { ToolEvidenceEnvelope } from '#/tool/toolContract';
 
 import type {
   AgentTask,
@@ -35,18 +38,36 @@ export class ProcessTask implements AgentTask {
   readonly kind = 'process' as const;
   readonly idPrefix = 'bash';
   private exitCode: number | null = null;
+  private settledEvidence: ToolEvidenceEnvelope | undefined;
 
   constructor(
     readonly proc: IProcess,
     readonly command: string,
     readonly description: string,
     private readonly onOutput?: ProcessTaskOutputCallback,
+    private readonly evidenceRecorder?: ProcessEvidenceRecorder,
   ) {}
+
+  evidence(): ToolEvidenceEnvelope | undefined {
+    return this.settledEvidence;
+  }
 
   async start(sink: AgentTaskSink): Promise<void> {
     const streamDrained = Promise.all([
-      observeProcessStream(this.proc.stdout, 'stdout', sink, this.onOutput),
-      observeProcessStream(this.proc.stderr, 'stderr', sink, this.onOutput),
+      observeProcessStream(
+        this.proc.stdout,
+        'stdout',
+        sink,
+        this.onOutput,
+        this.evidenceRecorder,
+      ),
+      observeProcessStream(
+        this.proc.stderr,
+        'stderr',
+        sink,
+        this.onOutput,
+        this.evidenceRecorder,
+      ),
     ]).then(() => undefined);
     void streamDrained.catch(() => {});
 
@@ -77,6 +98,22 @@ export class ProcessTask implements AgentTask {
     } finally {
       sink.signal.removeEventListener('abort', requestStop);
       await this.disposeProcess();
+    }
+
+    try {
+      const reason = sink.signal.reason;
+      const timedOut = isTimeoutReason(reason);
+      this.settledEvidence = await this.evidenceRecorder?.settle({
+        exitCode: this.exitCode,
+        timedOut,
+        cancelled: sink.signal.aborted && !timedOut,
+        terminationSignal: sink.signal.aborted ? 'SIGTERM' : undefined,
+      });
+    } catch (error) {
+      settlement = {
+        status: 'failed',
+        stopReason: `Process evidence persistence failed: ${errorMessage(error)}`,
+      };
     }
     await sink.settle(settlement);
   }
@@ -136,13 +173,20 @@ function observeProcessStream(
   kind: ProcessTaskOutputKind,
   sink: AgentTaskSink,
   onOutput?: ProcessTaskOutputCallback,
+  evidenceRecorder?: ProcessEvidenceRecorder,
 ): Promise<void> {
-  stream.setEncoding('utf8');
-  const onData = (chunk: string): void => {
-    if (chunk.length === 0) return;
-    sink.appendOutput(chunk);
+  const decoder = new StringDecoder('utf8');
+  const appendText = (text: string): void => {
+    if (text.length === 0) return;
+    sink.appendOutput(text);
     if (sink.signal.aborted) return;
-    onOutput?.(kind, chunk);
+    onOutput?.(kind, text);
+  };
+  const onData = (chunk: Buffer | string): void => {
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
+    if (bytes.byteLength === 0) return;
+    evidenceRecorder?.append(kind, bytes);
+    appendText(decoder.write(bytes));
   };
   stream.on('data', onData);
 
@@ -150,6 +194,7 @@ function observeProcessStream(
     let ended = false;
     const settle = (callback: () => void): void => {
       cleanup();
+      appendText(decoder.end());
       callback();
     };
     const done = (): void => {
@@ -167,7 +212,6 @@ function observeProcessStream(
         done();
         return;
       }
-
       fail(createPrematureCloseError());
     };
     const onError = (error: Error): void => {
@@ -295,4 +339,9 @@ function createPrematureCloseError(): Error {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function isTimeoutReason(reason: unknown): boolean {
+  const message = reason instanceof Error ? reason.message : String(reason ?? '');
+  return /time(?:d)?\s*out|timeout/i.test(message);
 }
