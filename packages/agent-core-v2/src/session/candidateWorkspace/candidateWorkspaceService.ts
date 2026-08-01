@@ -1,15 +1,25 @@
 import { createHash } from 'node:crypto';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+  readlink,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import type { CandidateId, WorkspaceSnapshotId } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
-import { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import { IBlobStore } from '#/persistence/interface/blobStore';
 import { ISessionProcessRunner } from '#/session/process/processRunner';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
-import { basename, dirname, join, normalize, relative } from 'pathe';
+import { dirname, join, normalize, relative } from 'pathe';
 import {
   ISessionCandidateWorkspaceService,
   type BaselineFileEntry,
@@ -19,7 +29,23 @@ import {
 } from './candidateWorkspace';
 
 const BASELINE_KEY = 'baseline.json';
-const SKIP_DIRECTORIES = new Set(['.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.turbo']);
+const SKIPPED_DIRECTORIES = new Set([
+  '.git',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  '.next',
+  '.turbo',
+]);
+
+interface BaselineMaterial {
+  readonly root: string;
+  readonly kind: 'git' | 'directory';
+  readonly gitCommit?: string;
+  readonly dirtyPatchHash?: string;
+  readonly files: readonly BaselineFileEntry[];
+}
 
 export class SessionCandidateWorkspaceService
   extends Disposable
@@ -37,7 +63,6 @@ export class SessionCandidateWorkspaceService
   constructor(
     @ISessionContext private readonly session: ISessionContext,
     @IBootstrapService bootstrap: IBootstrapService,
-    @IHostFileSystem private readonly fs: IHostFileSystem,
     @ISessionProcessRunner private readonly processes: ISessionProcessRunner,
     @IBlobStore private readonly blobs: IBlobStore,
     @IAtomicDocumentStore private readonly documents: IAtomicDocumentStore,
@@ -57,11 +82,18 @@ export class SessionCandidateWorkspaceService
   captureBaseline(signal?: AbortSignal): Promise<BaselineSnapshot> {
     return this.mutate(async () => {
       signal?.throwIfAborted();
-      const gitRootResult = await this.run(['git', '-C', this.session.cwd, 'rev-parse', '--show-toplevel'], this.session.cwd, signal, false);
-      const gitRoot = gitRootResult.exitCode === 0 ? gitRootResult.stdout.trim() : undefined;
+      const gitRootResult = await this.run(
+        ['git', '-C', this.session.cwd, 'rev-parse', '--show-toplevel'],
+        this.session.cwd,
+        signal,
+        false,
+      );
+      const gitRoot = gitRootResult.exitCode === 0
+        ? gitRootResult.stdout.trim()
+        : undefined;
       const material = gitRoot === undefined
-        ? await this.captureDirectory(this.session.cwd, signal)
-        : await this.captureGit(gitRoot, signal);
+        ? await this.describeDirectory(this.session.cwd, true, signal)
+        : await this.describeGit(gitRoot, true, signal);
       const hash = hashValue(material);
       const snapshot: BaselineSnapshot = {
         protocol: 'candidate-baseline/1',
@@ -87,12 +119,13 @@ export class SessionCandidateWorkspaceService
   ): Promise<CandidateWorkspace> {
     return this.mutate(async () => {
       signal?.throwIfAborted();
-      const baseline = this.requireBaseline();
       validatePatchPaths(patch);
+      const baseline = this.requireBaseline();
       const safeCandidate = safeSegment(candidateId);
       const target = join(this.workspacesRoot, safeCandidate);
       await this.removeWorkspace(target, baseline, signal);
-      await this.fs.mkdir(this.workspacesRoot, { recursive: true, mode: 0o700 });
+      await mkdir(this.workspacesRoot, { recursive: true, mode: 0o700 });
+
       if (baseline.kind === 'git') {
         await this.run(
           ['git', '-C', baseline.root, 'worktree', 'add', '--detach', target, baseline.gitCommit!],
@@ -101,18 +134,22 @@ export class SessionCandidateWorkspaceService
           true,
         );
         if (baseline.dirtyPatchHash !== undefined) {
-          const dirty = await this.requiredBlob(`patches/${baseline.dirtyPatchHash}`);
-          await this.applyPatch(target, Buffer.from(dirty).toString('utf8'), `${safeCandidate}.baseline.patch`, signal);
+          const dirtyPatch = Buffer.from(
+            await this.requiredBlob(`patches/${baseline.dirtyPatchHash}`),
+          ).toString('utf8');
+          await this.applyPatch(target, dirtyPatch, `${safeCandidate}.baseline.patch`, signal);
         }
       } else {
-        await this.fs.mkdir(target, { recursive: true, mode: 0o700 });
+        await mkdir(target, { recursive: true, mode: 0o700 });
       }
+
       await this.restoreFiles(target, baseline.files);
       const patchHash = hashText(patch);
       if (patch.length > 0) {
         await this.putBlobOnce(`patches/${patchHash}`, Buffer.from(patch));
         await this.applyPatch(target, patch, `${safeCandidate}.candidate.patch`, signal);
       }
+
       const workspaceHash = await this.hashDirectory(target, signal);
       const workspace: CandidateWorkspace = {
         candidateId,
@@ -127,24 +164,11 @@ export class SessionCandidateWorkspaceService
     });
   }
 
-  reconcileLive(patch: string, signal?: AbortSignal): Promise<CandidateWorkspaceReconciliation> {
-    return this.mutate(async () => {
-      const baseline = this.requireBaseline();
-      const live = baseline.kind === 'git'
-        ? await this.describeGit(baseline.root, signal)
-        : await this.describeDirectory(baseline.root, signal);
-      const liveHash = hashValue(live);
-      const unchanged = liveHash === baseline.hash;
-      const conflictedPaths = unchanged ? [] : await this.changedPaths(baseline, signal);
-      if (patch.length > 0) validatePatchPaths(patch);
-      return {
-        unchanged,
-        baselineHash: baseline.hash,
-        liveHash,
-        requiresRevalidation: !unchanged,
-        conflictedPaths,
-      };
-    });
+  reconcileLive(
+    patch: string,
+    signal?: AbortSignal,
+  ): Promise<CandidateWorkspaceReconciliation> {
+    return this.mutate(() => this.reconcileOutsideQueue(patch, signal));
   }
 
   applyToLive(patch: string, signal?: AbortSignal): Promise<void> {
@@ -155,18 +179,17 @@ export class SessionCandidateWorkspaceService
           `Live workspace changed after baseline capture: ${reconciliation.conflictedPaths.join(', ')}`,
         );
       }
-      const baseline = this.requireBaseline();
       validatePatchPaths(patch);
-      await this.applyPatch(baseline.root, patch, 'selected-live.patch', signal);
+      await this.applyPatch(this.requireBaseline().root, patch, 'selected-live.patch', signal);
     });
   }
 
   cleanup(candidateId: CandidateId): Promise<void> {
     return this.mutate(async () => {
       const baseline = this.requireBaseline();
-      const target = join(this.workspacesRoot, safeSegment(candidateId));
-      await this.removeWorkspace(target, baseline);
-      await this.documents.delete(this.scope, `workspace-${safeSegment(candidateId)}.json`);
+      const safeCandidate = safeSegment(candidateId);
+      await this.removeWorkspace(join(this.workspacesRoot, safeCandidate), baseline);
+      await this.documents.delete(this.scope, `workspace-${safeCandidate}.json`);
     });
   }
 
@@ -180,68 +203,54 @@ export class SessionCandidateWorkspaceService
     super.dispose();
   }
 
-  private async captureGit(
-    root: string,
-    signal?: AbortSignal,
-  ): Promise<Omit<BaselineSnapshot, 'protocol' | 'snapshotId' | 'createdAt' | 'hash'>> {
-    const description = await this.describeGit(root, signal);
-    if (description.dirtyPatchHash !== undefined && !(await this.blobs.has(this.artifactScope, `patches/${description.dirtyPatchHash}`))) {
-      const patch = await this.run(['git', '-C', root, 'diff', '--binary', 'HEAD'], root, signal, true);
-      await this.putBlobOnce(`patches/${description.dirtyPatchHash}`, Buffer.from(patch.stdout));
-    }
-    return description;
-  }
-
   private async describeGit(
     root: string,
+    retainArtifacts: boolean,
     signal?: AbortSignal,
-  ): Promise<Omit<BaselineSnapshot, 'protocol' | 'snapshotId' | 'createdAt' | 'hash'>> {
-    const commit = (await this.run(['git', '-C', root, 'rev-parse', 'HEAD'], root, signal, true)).stdout.trim();
-    const patch = (await this.run(['git', '-C', root, 'diff', '--binary', 'HEAD'], root, signal, true)).stdout;
+  ): Promise<BaselineMaterial> {
+    const commit = (
+      await this.run(['git', '-C', root, 'rev-parse', 'HEAD'], root, signal, true)
+    ).stdout.trim();
+    const patch = (
+      await this.run(['git', '-C', root, 'diff', '--binary', 'HEAD'], root, signal, true)
+    ).stdout;
     const dirtyPatchHash = patch.length === 0 ? undefined : hashText(patch);
-    const untracked = (await this.run(
-      ['git', '-C', root, 'ls-files', '--others', '--exclude-standard', '-z'],
-      root,
-      signal,
-      true,
-    )).stdout.split('\0').filter(Boolean).sort();
+    if (retainArtifacts && dirtyPatchHash !== undefined) {
+      await this.putBlobOnce(`patches/${dirtyPatchHash}`, Buffer.from(patch));
+    }
+    const untracked = (
+      await this.run(
+        ['git', '-C', root, 'ls-files', '--others', '--exclude-standard', '-z'],
+        root,
+        signal,
+        true,
+      )
+    ).stdout.split('\0').filter(Boolean).sort();
     const files: BaselineFileEntry[] = [];
     for (const relativePath of untracked) {
-      const entry = await this.captureFile(root, relativePath);
+      const entry = await this.captureFile(root, relativePath, retainArtifacts);
       if (entry !== undefined) files.push(entry);
     }
-    return {
-      root,
-      kind: 'git',
-      gitCommit: commit,
-      dirtyPatchHash,
-      files,
-    };
-  }
-
-  private async captureDirectory(
-    root: string,
-    signal?: AbortSignal,
-  ): Promise<Omit<BaselineSnapshot, 'protocol' | 'snapshotId' | 'createdAt' | 'hash'>> {
-    return this.describeDirectory(root, signal);
+    return { root, kind: 'git', gitCommit: commit, dirtyPatchHash, files };
   }
 
   private async describeDirectory(
     root: string,
+    retainArtifacts: boolean,
     signal?: AbortSignal,
-  ): Promise<Omit<BaselineSnapshot, 'protocol' | 'snapshotId' | 'createdAt' | 'hash'>> {
+  ): Promise<BaselineMaterial> {
     const files: BaselineFileEntry[] = [];
     const visit = async (directory: string): Promise<void> => {
       signal?.throwIfAborted();
-      const entries = [...(await this.fs.readdir(directory))].sort((a, b) => a.name.localeCompare(b.name));
+      const entries = await readdir(directory, { withFileTypes: true });
+      entries.sort((left, right) => left.name.localeCompare(right.name));
       for (const entry of entries) {
         const path = join(directory, entry.name);
-        if (entry.isDirectory) {
-          if (!SKIP_DIRECTORIES.has(entry.name)) await visit(path);
+        if (entry.isDirectory()) {
+          if (!SKIPPED_DIRECTORIES.has(entry.name)) await visit(path);
           continue;
         }
-        const relativePath = relative(root, path);
-        const captured = await this.captureFile(root, relativePath);
+        const captured = await this.captureFile(root, relative(root, path), retainArtifacts);
         if (captured !== undefined) files.push(captured);
       }
     };
@@ -249,22 +258,27 @@ export class SessionCandidateWorkspaceService
     return { root, kind: 'directory', files };
   }
 
-  private async captureFile(root: string, relativePath: string): Promise<BaselineFileEntry | undefined> {
+  private async captureFile(
+    root: string,
+    relativePath: string,
+    retainArtifact: boolean,
+  ): Promise<BaselineFileEntry | undefined> {
     const path = join(root, relativePath);
-    const stat = await this.fs.lstat(path);
+    const stat = await lstat(path);
     if (stat.isSymbolicLink()) {
+      const target = await readlink(path);
       return {
         relativePath,
-        sha256: hashText(await this.fs.readlink(path)),
+        sha256: hashText(target),
         byteLength: 0,
         executable: false,
-        symbolicLinkTarget: await this.fs.readlink(path),
+        symbolicLinkTarget: target,
       };
     }
     if (!stat.isFile()) return undefined;
-    const data = await this.fs.readFile(path);
+    const data = await readFile(path);
     const sha256 = hashBytes(data);
-    await this.putBlobOnce(`files/${sha256}`, data);
+    if (retainArtifact) await this.putBlobOnce(`files/${sha256}`, data);
     return {
       relativePath,
       sha256,
@@ -273,18 +287,22 @@ export class SessionCandidateWorkspaceService
     };
   }
 
-  private async restoreFiles(root: string, files: readonly BaselineFileEntry[]): Promise<void> {
+  private async restoreFiles(
+    root: string,
+    files: readonly BaselineFileEntry[],
+  ): Promise<void> {
     for (const entry of files) {
       const path = join(root, entry.relativePath);
-      await this.fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
-      await this.fs.rm(path, { force: true, recursive: true }).catch(() => undefined);
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      await rm(path, { force: true, recursive: true });
       if (entry.symbolicLinkTarget !== undefined) {
-        await this.fs.symlink(entry.symbolicLinkTarget, path);
+        await symlink(entry.symbolicLinkTarget, path);
         continue;
       }
-      const data = await this.requiredBlob(`files/${entry.sha256}`);
-      await this.fs.writeFile(path, data, { mode: entry.executable ? 0o700 : 0o600 });
-      if (entry.executable) await this.fs.chmod(path, 0o700);
+      await writeFile(path, await this.requiredBlob(`files/${entry.sha256}`), {
+        mode: entry.executable ? 0o700 : 0o600,
+      });
+      if (entry.executable) await chmod(path, 0o700);
     }
   }
 
@@ -297,8 +315,8 @@ export class SessionCandidateWorkspaceService
     if (patch.length === 0) return;
     validatePatchPaths(patch);
     const patchPath = join(this.workspacesRoot, patchName);
-    await this.fs.mkdir(dirname(patchPath), { recursive: true, mode: 0o700 });
-    await this.fs.writeText(patchPath, patch, { mode: 0o600 });
+    await mkdir(dirname(patchPath), { recursive: true, mode: 0o700 });
+    await writeFile(patchPath, patch, { mode: 0o600 });
     try {
       await this.run(
         ['git', '-C', root, 'apply', '--binary', '--whitespace=nowarn', patchPath],
@@ -307,7 +325,7 @@ export class SessionCandidateWorkspaceService
         true,
       );
     } finally {
-      await this.fs.rm(patchPath, { force: true });
+      await rm(patchPath, { force: true });
     }
   }
 
@@ -316,7 +334,7 @@ export class SessionCandidateWorkspaceService
     baseline: BaselineSnapshot,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (baseline.kind === 'git' && await exists(this.fs, target)) {
+    if (baseline.kind === 'git' && await pathExists(target)) {
       await this.run(
         ['git', '-C', baseline.root, 'worktree', 'remove', '--force', target],
         baseline.root,
@@ -324,7 +342,7 @@ export class SessionCandidateWorkspaceService
         false,
       );
     }
-    await this.fs.rm(target, { recursive: true, force: true });
+    await rm(target, { recursive: true, force: true });
   }
 
   private async changedPaths(
@@ -332,18 +350,22 @@ export class SessionCandidateWorkspaceService
     signal?: AbortSignal,
   ): Promise<readonly string[]> {
     if (baseline.kind !== 'git') return ['<directory-tree>'];
-    const tracked = (await this.run(
-      ['git', '-C', baseline.root, 'diff', '--name-only', 'HEAD'],
-      baseline.root,
-      signal,
-      false,
-    )).stdout.split('\n').filter(Boolean);
-    const untracked = (await this.run(
-      ['git', '-C', baseline.root, 'ls-files', '--others', '--exclude-standard'],
-      baseline.root,
-      signal,
-      false,
-    )).stdout.split('\n').filter(Boolean);
+    const tracked = (
+      await this.run(
+        ['git', '-C', baseline.root, 'diff', '--name-only', 'HEAD'],
+        baseline.root,
+        signal,
+        false,
+      )
+    ).stdout.split('\n').filter(Boolean);
+    const untracked = (
+      await this.run(
+        ['git', '-C', baseline.root, 'ls-files', '--others', '--exclude-standard'],
+        baseline.root,
+        signal,
+        false,
+      )
+    ).stdout.split('\n').filter(Boolean);
     return [...new Set([...tracked, ...untracked])].sort();
   }
 
@@ -351,10 +373,11 @@ export class SessionCandidateWorkspaceService
     patch: string,
     signal?: AbortSignal,
   ): Promise<CandidateWorkspaceReconciliation> {
+    validatePatchPaths(patch);
     const baseline = this.requireBaseline();
     const live = baseline.kind === 'git'
-      ? await this.describeGit(baseline.root, signal)
-      : await this.describeDirectory(baseline.root, signal);
+      ? await this.describeGit(baseline.root, false, signal)
+      : await this.describeDirectory(baseline.root, false, signal);
     const liveHash = hashValue(live);
     const unchanged = liveHash === baseline.hash;
     return {
@@ -367,17 +390,14 @@ export class SessionCandidateWorkspaceService
   }
 
   private async hashDirectory(root: string, signal?: AbortSignal): Promise<string> {
-    const description = await this.describeDirectory(root, signal);
-    return hashValue(description.files.map((entry) => ({
-      relativePath: entry.relativePath,
-      sha256: entry.sha256,
-      executable: entry.executable,
-      symbolicLinkTarget: entry.symbolicLinkTarget,
-    })));
+    const description = await this.describeDirectory(root, false, signal);
+    return hashValue(description.files);
   }
 
   private requireBaseline(): BaselineSnapshot {
-    if (this.currentBaseline === undefined) throw new Error('Adaptive baseline has not been captured.');
+    if (this.currentBaseline === undefined) {
+      throw new Error('Adaptive baseline has not been captured.');
+    }
     return this.currentBaseline;
   }
 
@@ -406,7 +426,9 @@ export class SessionCandidateWorkspaceService
   ): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
     signal?.throwIfAborted();
     const process = await this.processes.exec(args, { cwd });
-    const abort = (): void => { void process.kill().catch(() => undefined); };
+    const abort = (): void => {
+      void process.kill().catch(() => undefined);
+    };
     signal?.addEventListener('abort', abort, { once: true });
     try {
       const stdoutPromise = collect(process.stdout);
@@ -458,9 +480,15 @@ function validatePatchPaths(patch: string): void {
     if (!line.startsWith('+++ ') && !line.startsWith('--- ')) continue;
     const raw = line.slice(4).split('\t')[0]!.trim();
     if (raw === '/dev/null') continue;
-    const stripped = raw.startsWith('a/') || raw.startsWith('b/') ? raw.slice(2) : raw;
-    const normalized = normalize(stripped);
-    if (normalized.startsWith('/') || normalized === '..' || normalized.startsWith('../')) {
+    const stripped = raw.startsWith('a/') || raw.startsWith('b/')
+      ? raw.slice(2)
+      : raw;
+    const normalizedPath = normalize(stripped);
+    if (
+      normalizedPath.startsWith('/') ||
+      normalizedPath === '..' ||
+      normalizedPath.startsWith('../')
+    ) {
       throw new Error(`Patch path escapes the workspace: ${raw}`);
     }
   }
@@ -468,7 +496,9 @@ function validatePatchPaths(patch: string): void {
 
 function safeSegment(value: string): string {
   const safe = String(value).replaceAll(/[^A-Za-z0-9._-]/g, '_');
-  if (safe.length === 0 || safe === '.' || safe === '..') throw new Error('Invalid candidate identifier.');
+  if (safe.length === 0 || safe === '.' || safe === '..') {
+    throw new Error('Invalid candidate identifier.');
+  }
   return safe.slice(0, 128);
 }
 
@@ -499,9 +529,9 @@ function canonicalJson(value: unknown): string {
   });
 }
 
-async function exists(fs: IHostFileSystem, path: string): Promise<boolean> {
+async function pathExists(path: string): Promise<boolean> {
   try {
-    await fs.lstat(path);
+    await lstat(path);
     return true;
   } catch {
     return false;
