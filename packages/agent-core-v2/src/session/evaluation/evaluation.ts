@@ -1,10 +1,12 @@
 import { createDecorator } from '#/_base/di/instantiation';
 import type { IDisposable } from '#/_base/di/lifecycle';
-import type {
-  AdaptiveArtifactReference,
-  AdaptiveRunId,
-  EvaluationId,
-  EvaluationReplicateId,
+import {
+  EVALUATION_RESULT_PROTOCOL,
+  EVALUATION_SPEC_PROTOCOL,
+  type AdaptiveArtifactReference,
+  type AdaptiveRunId,
+  type EvaluationId,
+  type EvaluationReplicateId,
 } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 
 export type EvaluationMode = 'deterministic' | 'stochastic';
@@ -44,7 +46,7 @@ export interface EvaluationBudget {
 }
 
 export interface EvaluationSpec<TInput = unknown> {
-  readonly protocol: 'evaluation/1';
+  readonly protocol: typeof EVALUATION_SPEC_PROTOCOL;
   readonly evaluationId: EvaluationId;
   readonly adaptiveRunId?: AdaptiveRunId;
   readonly evaluatorId: string;
@@ -81,7 +83,7 @@ export interface EvaluationCost {
 }
 
 export interface EvaluationResult<TOutcome = unknown> {
-  readonly protocol: 'evaluation/1';
+  readonly protocol: typeof EVALUATION_RESULT_PROTOCOL;
   readonly evaluationId: EvaluationId;
   readonly evaluatorId: string;
   readonly evaluatorVersion: string;
@@ -126,7 +128,20 @@ export interface EvaluatorDefinition<TInput = unknown, TOutcome = unknown> {
   execute(
     input: TInput,
     context: EvaluationExecutionContext,
-  ): Promise<Omit<EvaluationResult<TOutcome>, 'protocol' | 'evaluationId' | 'evaluatorId' | 'evaluatorVersion' | 'mode' | 'soundness' | 'scale' | 'level' | 'outcomeFamily'>>;
+  ): Promise<
+    Omit<
+      EvaluationResult<TOutcome>,
+      | 'protocol'
+      | 'evaluationId'
+      | 'evaluatorId'
+      | 'evaluatorVersion'
+      | 'mode'
+      | 'soundness'
+      | 'scale'
+      | 'level'
+      | 'outcomeFamily'
+    >
+  >;
 }
 
 export interface ISessionEvaluationRegistry {
