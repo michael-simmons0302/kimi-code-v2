@@ -66,8 +66,11 @@ export class OrderedHookSlot<TContext> implements HookSlot<TContext> {
     };
     const target = options.before ?? options.after;
     if (target === undefined) {
-      this.entries.push(entry);
-      this.entries.sort(compareEntries);
+      const insertAt = this.entries.findIndex(
+        (existing) => compareEntries(entry, existing) < 0,
+      );
+      if (insertAt < 0) this.entries.push(entry);
+      else this.entries.splice(insertAt, 0, entry);
       return this.toEntryDisposable(entry);
     }
 
