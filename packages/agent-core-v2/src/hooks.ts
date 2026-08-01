@@ -4,7 +4,7 @@
  * Provides typed extension points with repeatable chaining and isolated context
  * forks. Bound as utility infrastructure, not a scoped Service.
  */
-import { toDisposable, type IDisposable } from "#/_base/di/lifecycle";
+import { toDisposable, type IDisposable } from '#/_base/di/lifecycle';
 
 export type Hooks<TEvents extends Record<string, unknown>> = {
   readonly [K in keyof TEvents]: HookSlot<TEvents[K]>;
@@ -30,15 +30,20 @@ export type HookHandler<TContext> = (
 export interface HookRegisterOptions {
   before?: string;
   after?: string;
+  /** Higher priority entries run earlier when no explicit before/after target is supplied. */
+  priority?: number;
 }
 
 interface HookEntry<TContext> {
   readonly id: string;
   readonly handler: HookHandler<TContext>;
+  readonly priority: number;
+  readonly sequence: number;
 }
 
 export class OrderedHookSlot<TContext> implements HookSlot<TContext> {
   private entries: HookEntry<TContext>[] = [];
+  private nextSequence = 0;
 
   register(
     id: string,
@@ -48,12 +53,21 @@ export class OrderedHookSlot<TContext> implements HookSlot<TContext> {
     if (options.before !== undefined && options.after !== undefined) {
       throw new Error('Hook registration cannot specify both before and after');
     }
+    if (options.priority !== undefined && !Number.isFinite(options.priority)) {
+      throw new Error('Hook priority must be finite');
+    }
 
     this.delete(id);
-    const entry = { id, handler };
+    const entry: HookEntry<TContext> = {
+      id,
+      handler,
+      priority: options.priority ?? 0,
+      sequence: this.nextSequence++,
+    };
     const target = options.before ?? options.after;
     if (target === undefined) {
       this.entries.push(entry);
+      this.entries.sort(compareEntries);
       return this.toEntryDisposable(entry);
     }
 
@@ -93,7 +107,10 @@ export class OrderedHookSlot<TContext> implements HookSlot<TContext> {
     terminal: (context: TContext) => Promise<void> = async () => {},
   ): Promise<void> {
     const entries = [...this.entries];
-    const dispatch = (index: number, ctx: TContext): ((override?: TContext) => Promise<void>) => {
+    const dispatch = (
+      index: number,
+      ctx: TContext,
+    ): ((override?: TContext) => Promise<void>) => {
       return async (override?: TContext): Promise<void> => {
         const current = override ?? ctx;
         const entry = entries[index];
@@ -108,9 +125,17 @@ export class OrderedHookSlot<TContext> implements HookSlot<TContext> {
   }
 }
 
-export function createHooks<TEvents extends Record<string, unknown>, TKeys extends keyof TEvents>(
-  keys: readonly TKeys[],
-): Hooks<TEvents> {
+function compareEntries<TContext>(
+  left: HookEntry<TContext>,
+  right: HookEntry<TContext>,
+): number {
+  return right.priority - left.priority || left.sequence - right.sequence;
+}
+
+export function createHooks<
+  TEvents extends Record<string, unknown>,
+  TKeys extends keyof TEvents,
+>(keys: readonly TKeys[]): Hooks<TEvents> {
   return Object.fromEntries(
     keys.map((key) => [key, new OrderedHookSlot<TEvents[TKeys]>()]),
   ) as unknown as Hooks<TEvents>;
