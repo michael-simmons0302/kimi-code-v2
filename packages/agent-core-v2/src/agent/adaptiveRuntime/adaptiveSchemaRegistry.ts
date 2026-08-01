@@ -1,27 +1,29 @@
 import { z } from 'zod';
 
 import {
+  ADAPTIVE_ARCHITECTURE_VERSION,
   ADAPTIVE_EVIDENCE_GRAPH_PROTOCOL,
   ADAPTIVE_LEDGER_PROTOCOL,
   ADAPTIVE_PROMPT_PROTOCOL,
   ADAPTIVE_PROTOCOL_REGISTRY,
-  ADAPTIVE_SEARCH_CHECKPOINT_PROTOCOL,
-  ADAPTIVE_STRUCTURE_PROTOCOL,
-  ADAPTIVE_WORLD_MODEL_PROTOCOL,
   BENCHMARK_MANIFEST_PROTOCOL,
   CANDIDATE_WORKSPACE_PROTOCOL,
   CAUSAL_RULE_PROTOCOL,
+  CODE_STRUCTURE_GRAPH_PROTOCOL,
   EVALUATION_RESULT_PROTOCOL,
+  EVALUATION_SANDBOX_PROTOCOL,
   EVALUATION_SPEC_PROTOCOL,
   PROGRAM_ARCHIVE_PROTOCOL,
-  SANDBOX_PROTOCOL,
-  STRUCTURAL_SIGNAL_PROTOCOL,
+  SEARCH_CHECKPOINT_PROTOCOL,
+  STRUCTURAL_SIGNALS_PROTOCOL,
+  WORLD_MODEL_PROTOCOL,
+  WORLD_MODEL_STORE_PROTOCOL,
 } from './adaptiveProtocol';
 
 export type AdaptiveProtocolName = keyof typeof ADAPTIVE_PROTOCOL_REGISTRY;
 export type AdaptiveProtocolValue = (typeof ADAPTIVE_PROTOCOL_REGISTRY)[AdaptiveProtocolName];
 
-export const AdaptiveUuidSchema = z.uuid();
+export const AdaptiveUuidSchema = z.string().uuid();
 export const AdaptiveHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const AdaptiveIdentifierSchema = z.string().min(1).max(512);
 export const AdaptiveSequenceSchema = z.number().int().nonnegative();
@@ -48,22 +50,24 @@ export const AdaptivePhaseSchema = z.enum([
 ]);
 
 export const AdaptiveCostSchema = z.object({
+  internalRequests: z.number().int().nonnegative(),
+  evaluations: z.number().int().nonnegative(),
+  stochasticReplicates: z.number().int().nonnegative(),
+  toolCalls: z.number().int().nonnegative(),
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
-  toolCalls: z.number().int().nonnegative(),
-  evaluationRuns: z.number().int().nonnegative(),
-  modelProposalCount: z.number().int().nonnegative(),
   wallMs: z.number().nonnegative(),
   cpuMs: z.number().nonnegative(),
   diskBytes: z.number().int().nonnegative(),
 }).strict();
 
 export const AdaptiveBudgetSchema = z.object({
+  maxInternalRequests: z.number().int().positive(),
+  maxEvaluations: z.number().int().positive(),
+  maxStochasticReplicates: z.number().int().positive(),
+  maxToolCalls: z.number().int().positive(),
   maxInputTokens: z.number().int().positive(),
   maxOutputTokens: z.number().int().positive(),
-  maxToolCalls: z.number().int().positive(),
-  maxEvaluationRuns: z.number().int().positive(),
-  maxModelProposalCount: z.number().int().positive(),
   maxWallMs: z.number().positive(),
   maxCpuMs: z.number().positive(),
   maxDiskBytes: z.number().int().positive(),
@@ -119,7 +123,7 @@ class AdaptiveSchemaRegistry {
     return this.get(protocol).schema.parse(value) as TOutput;
   }
 
-  safeParse(protocol: string, value: unknown): z.ZodSafeParseResult<unknown> {
+  safeParse(protocol: string, value: unknown): z.SafeParseReturnType<unknown, unknown> {
     return this.get(protocol).schema.safeParse(value);
   }
 
@@ -141,7 +145,13 @@ export function registerAdaptiveSchema<TOutput>(
 const ProtocolHeader = <TProtocol extends string>(protocol: TProtocol) =>
   z.object({ protocol: z.literal(protocol) }).passthrough();
 
-for (const registration of [
+const registrations = [
+  {
+    protocol: ADAPTIVE_ARCHITECTURE_VERSION,
+    description: 'Adaptive architecture version marker.',
+    persisted: true,
+    rpcVisible: true,
+  },
   {
     protocol: ADAPTIVE_LEDGER_PROTOCOL,
     description: 'Immutable adaptive evidence ledger record or head.',
@@ -167,13 +177,13 @@ for (const registration of [
     rpcVisible: true,
   },
   {
-    protocol: ADAPTIVE_STRUCTURE_PROTOCOL,
+    protocol: CODE_STRUCTURE_GRAPH_PROTOCOL,
     description: 'Code-structure graph snapshot.',
     persisted: true,
     rpcVisible: true,
   },
   {
-    protocol: STRUCTURAL_SIGNAL_PROTOCOL,
+    protocol: STRUCTURAL_SIGNALS_PROTOCOL,
     description: 'Structural signal and reducer state.',
     persisted: true,
     rpcVisible: true,
@@ -185,13 +195,19 @@ for (const registration of [
     rpcVisible: true,
   },
   {
-    protocol: ADAPTIVE_WORLD_MODEL_PROTOCOL,
-    description: 'Executable world-model manifest and population state.',
+    protocol: WORLD_MODEL_PROTOCOL,
+    description: 'Executable world-model manifest.',
     persisted: true,
     rpcVisible: true,
   },
   {
-    protocol: ADAPTIVE_SEARCH_CHECKPOINT_PROTOCOL,
+    protocol: WORLD_MODEL_STORE_PROTOCOL,
+    description: 'Executable world-model population and belief store.',
+    persisted: true,
+    rpcVisible: true,
+  },
+  {
+    protocol: SEARCH_CHECKPOINT_PROTOCOL,
     description: 'Belief-state search checkpoint.',
     persisted: true,
     rpcVisible: true,
@@ -209,7 +225,7 @@ for (const registration of [
     rpcVisible: false,
   },
   {
-    protocol: SANDBOX_PROTOCOL,
+    protocol: EVALUATION_SANDBOX_PROTOCOL,
     description: 'Secure sandbox request and result.',
     persisted: true,
     rpcVisible: false,
@@ -226,7 +242,9 @@ for (const registration of [
     persisted: true,
     rpcVisible: true,
   },
-] as const) {
+] as const;
+
+for (const registration of registrations) {
   registerAdaptiveSchema({
     ...registration,
     schema: ProtocolHeader(registration.protocol),
