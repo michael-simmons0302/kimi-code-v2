@@ -38,6 +38,7 @@ export interface AdaptiveExportPreparation {
   readonly manifest: AdaptiveExportManifest;
   readonly excludedArtifactHashes: readonly string[];
   readonly retainedArtifactHashes: readonly string[];
+  readonly excludedPathFragments: readonly string[];
 }
 
 export interface ISessionAdaptiveExportService {
