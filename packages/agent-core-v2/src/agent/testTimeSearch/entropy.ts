@@ -15,6 +15,15 @@ export interface DiscoveryWeightScheduleInput {
   readonly remainingBudgetFraction: number;
 }
 
+export interface DiscoveryTemperatureDecision {
+  readonly temperature: number;
+  readonly reason:
+    | 'low-budget'
+    | 'no-decision-relevant-disagreement'
+    | 'stagnated-disagreement'
+    | 'default-discovery';
+}
+
 export function posteriorEntropy(weights: readonly number[]): number {
   return entropyOfProbabilities(normalizeProbabilities(weights));
 }
@@ -59,7 +68,9 @@ export function expectedConditionalOutcomeEntropy<T>(
 ): number {
   const weights = normalizeProbabilities(models.map((model) => model.weight));
   return models.reduce((total, model, index) => {
-    const modelEntropy = entropyOfProbabilities([...normalizeDistribution(model.distribution).values()]);
+    const modelEntropy = entropyOfProbabilities([
+      ...normalizeDistribution(model.distribution).values(),
+    ]);
     return total + (weights[index] ?? 0) * modelEntropy;
   }, 0);
 }
@@ -79,6 +90,25 @@ export function normalizedEpistemicInformationGain<T>(
   const outcomes = aggregatePredictiveDistribution(models).size;
   if (outcomes <= 1) return 0;
   return epistemicInformationGain(models) / Math.log(outcomes);
+}
+
+export function expectedPosteriorEntropy<T>(
+  models: readonly WeightedDistribution<T>[],
+): number {
+  const priorWeights = normalizeProbabilities(models.map((model) => model.weight));
+  const predictive = aggregatePredictiveDistribution(models);
+  let expected = 0;
+
+  for (const [outcome, outcomeProbability] of predictive) {
+    if (outcomeProbability <= 0) continue;
+    const posteriorWeights = models.map((model, index) => {
+      const modelProbability = normalizeDistribution(model.distribution).get(outcome) ?? 0;
+      return (priorWeights[index] ?? 0) * modelProbability;
+    });
+    expected += outcomeProbability * posteriorEntropy(posteriorWeights);
+  }
+
+  return expected;
 }
 
 export function effectivePosteriorSampleSize(weights: readonly number[]): number {
@@ -101,7 +131,10 @@ export function estimateDecisionSensitivity<TDecision>(
   branches: readonly HypotheticalDecisionBranch<TDecision>[],
   materiallyEqual: (left: TDecision, right: TDecision) => boolean,
 ): number {
-  const total = branches.reduce((sum, branch) => sum + Math.max(0, branch.probability), 0);
+  const total = branches.reduce(
+    (sum, branch) => sum + Math.max(0, branch.probability),
+    0,
+  );
   if (total <= 0) return 0;
   const changed = branches.reduce(
     (sum, branch) =>
@@ -134,16 +167,36 @@ export function temperDiscoveryWeights(
   );
 }
 
+export function resolveDiscoveryTemperatureDecision(
+  input: DiscoveryWeightScheduleInput,
+): DiscoveryTemperatureDecision {
+  if (input.remainingBudgetFraction < 0.25) {
+    return { temperature: 1, reason: 'low-budget' };
+  }
+  if (!input.decisionRelevantDisagreement) {
+    return { temperature: 1, reason: 'no-decision-relevant-disagreement' };
+  }
+  if (input.stagnated) {
+    return { temperature: 0.5, reason: 'stagnated-disagreement' };
+  }
+  return { temperature: 0.75, reason: 'default-discovery' };
+}
+
 export function resolveDiscoveryTemperature(input: DiscoveryWeightScheduleInput): number {
-  if (input.remainingBudgetFraction < 0.25) return 1;
-  if (!input.decisionRelevantDisagreement) return 1;
-  if (input.stagnated) return 0.5;
-  return 0.75;
+  return resolveDiscoveryTemperatureDecision(input).temperature;
 }
 
 export function binarySupportEntropy(probability: number): number {
   const p = clamp01(probability);
   return entropyOfProbabilities([p, 1 - p]);
+}
+
+export function ruleSupportEntropy(probability: number): number {
+  return binarySupportEntropy(probability);
+}
+
+export function conflictEntropy(probability: number): number {
+  return binarySupportEntropy(probability);
 }
 
 export function normalizeProbabilities(values: readonly number[]): readonly number[] {
@@ -160,9 +213,13 @@ function normalizeDistribution<T>(
   distribution: ReadonlyMap<T, number>,
 ): ReadonlyMap<T, number> {
   const entries = [...distribution.entries()];
-  const probabilities = normalizeProbabilities(entries.map(([, probability]) => probability));
+  const probabilities = normalizeProbabilities(
+    entries.map(([, probability]) => probability),
+  );
   const normalized = new Map<T, number>();
-  entries.forEach(([outcome], index) => normalized.set(outcome, probabilities[index] ?? 0));
+  entries.forEach(([outcome], index) =>
+    normalized.set(outcome, probabilities[index] ?? 0),
+  );
   return normalized;
 }
 
