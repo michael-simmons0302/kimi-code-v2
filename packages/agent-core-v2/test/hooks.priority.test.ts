@@ -47,6 +47,34 @@ describe('OrderedHookSlot priority', () => {
     expect(context.trace).toEqual(['a', 'b', 'c']);
   });
 
+  it('does not disturb explicit placement when a priority hook is registered later', async () => {
+    const slot = new OrderedHookSlot<{ trace: string[] }>();
+    slot.register('a', async (context, next) => {
+      context.trace.push('a');
+      await next();
+    });
+    slot.register('c', async (context, next) => {
+      context.trace.push('c');
+      await next();
+    });
+    slot.register('b', async (context, next) => {
+      context.trace.push('b');
+      await next();
+    }, { before: 'c', priority: -10_000 });
+    slot.register('first', async (context, next) => {
+      context.trace.push('first');
+      await next();
+    }, { priority: 100 });
+    slot.register('last', async (context, next) => {
+      context.trace.push('last');
+      await next();
+    }, { priority: -20_000 });
+
+    const context = { trace: [] as string[] };
+    await slot.run(context);
+    expect(context.trace).toEqual(['first', 'a', 'b', 'c', 'last']);
+  });
+
   it('rejects non-finite priorities', () => {
     const slot = new OrderedHookSlot<object>();
     expect(() => slot.register('bad', async (_context, next) => next(), {
