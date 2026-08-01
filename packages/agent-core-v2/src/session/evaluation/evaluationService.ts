@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto';
 
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
-import { EVALUATION_RESULT_PROTOCOL } from '#/agent/adaptiveRuntime/adaptiveProtocol';
+import {
+  EVALUATION_RESULT_PROTOCOL,
+  createEvidenceId,
+  type EvidenceId,
+} from '#/agent/adaptiveRuntime/adaptiveProtocol';
+import {
+  ISessionEvidenceGraphService,
+} from '#/session/evaluationLedger/evidenceGraph';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
 import {
   ISessionEvaluationCacheService,
@@ -27,6 +34,7 @@ export class SessionEvaluationService
   constructor(
     @ISessionEvaluationRegistry private readonly registry: ISessionEvaluationRegistry,
     @ISessionEvaluationLedgerService private readonly ledger: ISessionEvaluationLedgerService,
+    @ISessionEvidenceGraphService private readonly evidenceGraph: ISessionEvidenceGraphService,
     @ISessionEvaluationCacheService private readonly cache: ISessionEvaluationCacheService,
   ) {
     super();
@@ -36,7 +44,12 @@ export class SessionEvaluationService
     spec: EvaluationSpec<TInput>,
     signal?: AbortSignal,
   ): Promise<EvaluationResult<TOutcome>> {
-    await Promise.all([this.ledger.ready(), this.cache.ready()]);
+    await Promise.all([
+      this.ledger.ready(),
+      this.evidenceGraph.ready(),
+      this.cache.ready(),
+    ]);
+    await this.validateInputEvidenceRefs(spec.inputEvidenceRefs ?? []);
     const definition = this.registry.get(spec.evaluatorId);
     if (
       spec.evaluatorVersion !== undefined &&
@@ -69,6 +82,7 @@ export class SessionEvaluationService
         scale: definition.scale,
         level: definition.level,
         inputHash: hashValue(spec.input),
+        inputEvidenceRefs: spec.inputEvidenceRefs ?? [],
         evaluationSpecHash: evaluationSpecHash(spec, definition.version),
         environmentHash: cacheContext?.environment.environmentHash,
         cachePolicy: definition.cachePolicy,
@@ -88,21 +102,20 @@ export class SessionEvaluationService
         adaptiveRunId: spec.adaptiveRunId,
         payload: {
           evaluationId: spec.evaluationId,
+          evidenceId: result.evidenceId,
           cacheKey: cacheHit.cacheKey,
           sourceEvaluationId: cacheHit.provenance.sourceEvaluationId,
+          sourceEvidenceId: cacheHit.entry.result.evidenceId,
           sourceSequence: cacheHit.provenance.createdAtSequence,
           environmentHash: cacheHit.entry.environment.environmentHash,
           seedMatched: cacheHit.provenance.seedMatched,
         },
       });
-      await this.ledger.append({
-        recordType: 'evaluation.completed',
-        adaptiveRunId: spec.adaptiveRunId,
-        payload: result,
-      });
+      await this.completeAndLink(spec, result, cacheHit.entry.result.evidenceId);
       return result;
     }
 
+    const evidenceId = createEvidenceId();
     let result: EvaluationResult<TOutcome>;
     try {
       const output = (await definition.execute(spec.input, {
@@ -113,6 +126,7 @@ export class SessionEvaluationService
         EvaluationResult<TOutcome>,
         | 'protocol'
         | 'evaluationId'
+        | 'evidenceId'
         | 'evaluatorId'
         | 'evaluatorVersion'
         | 'mode'
@@ -133,6 +147,7 @@ export class SessionEvaluationService
       const base: EvaluationResult<TOutcome> = {
         protocol: EVALUATION_RESULT_PROTOCOL,
         evaluationId: spec.evaluationId,
+        evidenceId,
         evaluatorId: definition.evaluatorId,
         evaluatorVersion: definition.version,
         mode: definition.mode,
@@ -155,6 +170,7 @@ export class SessionEvaluationService
       const base: EvaluationResult<TOutcome> = {
         protocol: EVALUATION_RESULT_PROTOCOL,
         evaluationId: spec.evaluationId,
+        evidenceId,
         evaluatorId: definition.evaluatorId,
         evaluatorVersion: definition.version,
         mode: definition.mode,
@@ -177,11 +193,7 @@ export class SessionEvaluationService
       result = { ...base, resultHash: hashValue(base) };
     }
 
-    const completed = await this.ledger.append({
-      recordType: 'evaluation.completed',
-      adaptiveRunId: spec.adaptiveRunId,
-      payload: result,
-    });
+    const completed = await this.completeAndLink(spec, result);
 
     if (cacheContext !== undefined && isCacheableResult(result, spec.seed)) {
       try {
@@ -197,6 +209,7 @@ export class SessionEvaluationService
           adaptiveRunId: spec.adaptiveRunId,
           payload: {
             evaluationId: spec.evaluationId,
+            evidenceId: result.evidenceId,
             cacheKey: entry.cacheKey,
             mode: entry.mode,
             environmentHash: entry.environment.environmentHash,
@@ -209,6 +222,7 @@ export class SessionEvaluationService
           adaptiveRunId: spec.adaptiveRunId,
           payload: {
             evaluationId: spec.evaluationId,
+            evidenceId: result.evidenceId,
             error: error instanceof Error ? error.message : String(error),
           },
         });
@@ -225,12 +239,61 @@ export class SessionEvaluationService
   }
 
   async flush(): Promise<void> {
-    await Promise.all([this.ledger.flush(), this.cache.flush()]);
+    await Promise.all([
+      this.ledger.flush(),
+      this.evidenceGraph.flush(),
+      this.cache.flush(),
+    ]);
   }
 
   override dispose(): void {
     void this.flush();
     super.dispose();
+  }
+
+  private async validateInputEvidenceRefs(refs: readonly EvidenceId[]): Promise<void> {
+    const unique = new Set<EvidenceId>();
+    for (const evidenceId of refs) {
+      if (unique.has(evidenceId)) continue;
+      unique.add(evidenceId);
+      if (await this.evidenceGraph.getNode(evidenceId) === undefined) {
+        throw new Error(`Evaluation input evidence does not exist: ${evidenceId}`);
+      }
+    }
+  }
+
+  private async completeAndLink<TInput, TOutcome>(
+    spec: EvaluationSpec<TInput>,
+    result: EvaluationResult<TOutcome>,
+    cacheSourceEvidenceId?: EvidenceId,
+  ) {
+    if (result.evidenceId === undefined) {
+      throw new Error(`Evaluation result lacks immutable evidence identity: ${spec.evaluationId}`);
+    }
+    const completed = await this.ledger.append({
+      recordType: 'evaluation.completed',
+      adaptiveRunId: spec.adaptiveRunId,
+      evidenceId: result.evidenceId,
+      payload: result,
+    });
+    for (const inputEvidenceId of new Set(spec.inputEvidenceRefs ?? [])) {
+      await this.evidenceGraph.appendLink({
+        fromEvidenceId: inputEvidenceId,
+        toEvidenceId: result.evidenceId,
+        relation: 'evaluated',
+      });
+    }
+    if (
+      cacheSourceEvidenceId !== undefined &&
+      cacheSourceEvidenceId !== result.evidenceId
+    ) {
+      await this.evidenceGraph.appendLink({
+        fromEvidenceId: cacheSourceEvidenceId,
+        toEvidenceId: result.evidenceId,
+        relation: 'derived-from',
+      });
+    }
+    return completed;
   }
 }
 
@@ -293,6 +356,7 @@ function reidentifyCachedResult<TOutcome>(
   const base: EvaluationResult<TOutcome> = {
     ...source,
     evaluationId: spec.evaluationId,
+    evidenceId: createEvidenceId(),
     resultHash: undefined,
     cost: {
       ...source.cost,
@@ -319,6 +383,7 @@ function evaluationSpecHash<TInput>(
     evaluatorId: spec.evaluatorId,
     evaluatorVersion,
     input: spec.input,
+    inputEvidenceRefs: [...(spec.inputEvidenceRefs ?? [])].sort(),
     budget: spec.budget,
     seed: spec.seed,
     tags: spec.tags ?? [],
