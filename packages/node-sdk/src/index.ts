@@ -3,11 +3,8 @@ export type { KimiHarnessRuntimeOptions } from '#/kimi-harness';
 export { Session } from '#/session';
 export { KimiAuthFacade } from '#/auth';
 export { createKimiHarness, SDKRpcClient, type SDKRpcClientOptions } from '#/sdk-rpc-client';
-export {
-  createKimiHarnessV2,
-  SDKRpcClientV2,
-  type SDKRpcClientV2Options,
-} from '#/sdk-rpc-client-v2';
+export { createKimiHarnessV2 } from '#/adaptive-harness-v2';
+export { SDKRpcClientV2, type SDKRpcClientV2Options } from '#/sdk-rpc-client-v2';
 export {
   createKimiConfigRpc,
   KimiConfigRpcClient,
