@@ -1,26 +1,22 @@
 /**
  * `tool` domain — foundational tool model contract.
- *
- * Owns the tool model shared by every tool domain: the static metadata
- * (`ToolSource` / `ToolDefinition` / `ToolInfo`), the `ExecutableTool`
- * contract every tool implements (`resolveExecution` → `ToolExecution` →
- * `execute(ctx)`), the `ExecutableToolContext` it runs against, the raw and
- * finalized results (`ExecutableToolResult` / `ToolResult`), the streaming
- * `ToolUpdate`, and the `AgentTool` service interface every DI-registered
- * agent tool implements. Also owns the `ToolAccesses`
- * resource-access declarations an execution emits so the host scheduler can
- * run non-conflicting calls concurrently (together with their conflict
- * semantics), and the `isMcpToolName` name predicate. The `stopTurn` /
- * `stopBatchAfterThis` fields are internal loop-control hints stripped
- * before persistence. No scoped service.
  */
 
-import type { ContentPart, ToolCall } from '#/kosong/contract/message';
-import type { Tool } from '#/kosong/contract/tool';
-import type { LLMRequestTrace } from '#/kosong/contract/requestTrace';
 import type { ToolInputDisplay } from '@moonshot-ai/protocol';
 
+import type { ContentPart, ToolCall } from '#/kosong/contract/message';
+import type { LLMRequestTrace } from '#/kosong/contract/requestTrace';
+import type { Tool } from '#/kosong/contract/tool';
+
 export type ExecutableToolOutput = string | ContentPart[];
+
+export interface ToolEvidenceEnvelope {
+  readonly kind: string;
+  readonly schemaVersion: number;
+  readonly payload: unknown;
+  readonly artifactRefs?: readonly string[];
+  readonly sensitivity?: 'ordinary' | 'sensitive' | 'secret';
+}
 
 export type ToolDeliveryKind = 'steer';
 
@@ -43,6 +39,7 @@ export interface ExecutableToolSuccessResult {
   readonly truncated?: boolean | undefined;
   readonly note?: string;
   readonly delivery?: ToolDelivery | undefined;
+  readonly evidence?: ToolEvidenceEnvelope;
 }
 
 export interface ExecutableToolErrorResult {
@@ -52,6 +49,7 @@ export interface ExecutableToolErrorResult {
   readonly truncated?: boolean | undefined;
   readonly note?: string;
   readonly delivery?: ToolDelivery | undefined;
+  readonly evidence?: ToolEvidenceEnvelope;
 }
 
 export type ExecutableToolResult = ExecutableToolSuccessResult | ExecutableToolErrorResult;
