@@ -15,6 +15,7 @@ await withScopedRegistrationActivation(ScopeActivation.OnDemand, async () => {
     import('#/agent/adaptivePrompt/adaptiveDirectiveService'),
     import('#/agent/adaptiveMemory/adaptiveMemoryService'),
     import('#/agent/evaluationEvidence/evaluationEvidenceService'),
+    import('#/agent/evaluationEvidence/processEvidenceRecorderService'),
     import('#/agent/causalRuleGraph/causalRuleGraphService'),
     import('#/agent/worldModel/worldModelCalibrationService'),
     import('#/agent/worldModel/worldModelService'),
