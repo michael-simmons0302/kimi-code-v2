@@ -16,8 +16,15 @@ export function toolResultEvidenceId(
   return evidenceId('tool-result', toolCallId, providerTraceId);
 }
 
+export function processExecutionEvidenceId(
+  toolCallId: string,
+  providerTraceId?: string,
+): EvidenceId {
+  return evidenceId('process-execution', toolCallId, providerTraceId);
+}
+
 function evidenceId(
-  kind: 'tool-call' | 'tool-result',
+  kind: 'tool-call' | 'tool-result' | 'process-execution',
   toolCallId: string,
   providerTraceId?: string,
 ): EvidenceId {
