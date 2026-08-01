@@ -21,6 +21,18 @@ interface WorkerFailure {
 }
 
 type WorkerResult = WorkerSuccess | WorkerFailure;
+type InternalWorldModelMethod = WorldModelMethod | '__validate__';
+
+const REQUIRED_METHODS: readonly WorldModelMethod[] = [
+  'encodeObservation',
+  'enumerateActions',
+  'predictTransition',
+  'predictObservation',
+  'predictReward',
+  'predictTerminal',
+  'projectOutcome',
+  'explainPrediction',
+];
 
 const WORKER_SOURCE = String.raw`
 const { parentPort, workerData } = require('node:worker_threads');
@@ -101,6 +113,12 @@ try {
 
 parentPort.on('message', async ({ method, args }) => {
   try {
+    if (method === '__validate__') {
+      const missing = workerData.requiredMethods.filter((name) => typeof model[name] !== 'function');
+      if (missing.length > 0) throw new Error('World model is missing required methods: ' + missing.join(', '));
+      parentPort.postMessage({ ok: true, value: { methods: workerData.requiredMethods } });
+      return;
+    }
     const fn = model[method];
     if (typeof fn !== 'function') throw new Error('World model method is not implemented: ' + method);
     const value = await fn.apply(undefined, args);
@@ -111,9 +129,30 @@ parentPort.on('message', async ({ method, args }) => {
 });
 `;
 
-export async function invokeWorldModelModule<T>(
+export function validateWorldModelModule(
+  compiledSource: string,
+  options: WorldModelRuntimeOptions,
+): Promise<void> {
+  return invokeInternal<{ readonly methods: readonly string[] }>(
+    compiledSource,
+    '__validate__',
+    [],
+    options,
+  ).then(() => undefined);
+}
+
+export function invokeWorldModelModule<T>(
   compiledSource: string,
   method: WorldModelMethod,
+  args: readonly unknown[],
+  options: WorldModelRuntimeOptions,
+): Promise<T> {
+  return invokeInternal<T>(compiledSource, method, args, options);
+}
+
+async function invokeInternal<T>(
+  compiledSource: string,
+  method: InternalWorldModelMethod,
   args: readonly unknown[],
   options: WorldModelRuntimeOptions,
 ): Promise<T> {
@@ -131,6 +170,7 @@ export async function invokeWorldModelModule<T>(
       source: compiledSource,
       seed: options.seed ?? '0',
       initializationTimeoutMs: Math.min(5_000, options.timeoutMs),
+      requiredMethods: REQUIRED_METHODS,
     },
     resourceLimits: {
       maxOldGenerationSizeMb: Math.floor(options.memoryLimitMb),
