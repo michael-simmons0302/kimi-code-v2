@@ -27,6 +27,8 @@ export interface SearchCheckpointInput<TState = unknown> {
   readonly createdAtSequence: number;
   readonly architectureVersion: string;
   readonly protocolVersions: Readonly<Record<string, string>>;
+  readonly configHash?: string;
+  readonly workspaceSnapshotHash?: string;
   readonly state: TState;
   readonly budget: AdaptiveBudget;
   readonly cost: AdaptiveCost;
@@ -52,18 +54,34 @@ export interface SearchCheckpointHead {
   readonly sequence: number;
 }
 
+export type SearchCheckpointRejectionReason =
+  | 'invalid-hash'
+  | 'duplicate-hash'
+  | 'missing-parent'
+  | 'forked-chain'
+  | 'cycle'
+  | 'ledger-ahead'
+  | 'incompatible';
+
+export interface SearchCheckpointRejection {
+  readonly checkpointId: string;
+  readonly checkpointHash: string;
+  readonly reason: SearchCheckpointRejectionReason;
+  readonly detail: string;
+}
+
 export interface SearchCheckpointRecovery<TState = unknown> {
   readonly checkpoint?: SearchCheckpoint<TState>;
   readonly recoveredFromPrior: boolean;
-  readonly rejected: readonly {
-    readonly checkpointId: string;
-    readonly reason: string;
-  }[];
+  readonly exactRequestedHead: boolean;
+  readonly rejected: readonly SearchCheckpointRejection[];
 }
 
 export interface SearchCheckpointCompatibility {
   readonly architectureVersion: string;
   readonly protocolVersions: Readonly<Record<string, string>>;
+  readonly configHash?: string;
+  readonly workspaceSnapshotHash?: string;
 }
 
 export interface ISessionSearchCheckpointService {
