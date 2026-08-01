@@ -1,3 +1,4 @@
+import type { KimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -6,11 +7,7 @@ import {
   withAdaptiveHostMode,
 } from '#/app/bootstrap/bootstrap';
 
-const IDENTITY = {
-  product: 'test',
-  version: '0.0.0',
-  userAgent: 'test/0.0.0',
-};
+const IDENTITY = {} as KimiHostIdentity;
 
 describe('adaptive HostArgs', () => {
   it('defaults to disabled', () => {
