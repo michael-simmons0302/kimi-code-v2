@@ -98,16 +98,21 @@ export class LinuxSandboxBackend implements SandboxBackend {
       id: 'linux-bwrap',
       available: functional.exitCode === 0,
       version: bwrap.stdout.trim(),
-      reason: functional.exitCode === 0
-        ? undefined
-        : `bubblewrap cannot create the required namespace sandbox: ${functional.stderr.trim()}`,
+      reason:
+        functional.exitCode === 0
+          ? undefined
+          : `bubblewrap cannot create the required namespace sandbox: ${functional.stderr.trim()}`,
       supportedCapabilities: COMMON_SANDBOX_CAPABILITIES,
     };
   }
 
   async command(request: SandboxExecutionRequest): Promise<SandboxCommand> {
     validateRequestShape(request);
-    const args = await buildBwrapArgs(request, request.workspacePath, request.mounts ?? []);
+    const args = await buildBwrapArgs(
+      request,
+      request.workspacePath,
+      request.mounts ?? [],
+    );
     return { args: prlimitPrefix(request).concat(args), cwd: request.workspacePath };
   }
 }
@@ -178,8 +183,13 @@ export function validateMount(mount: SandboxMount): void {
   if (!isAbsolute(mount.source)) {
     throw new Error(`Sandbox mount source must be absolute: ${mount.source}`);
   }
-  if (!isAbsolute(mount.target) || !normalize(mount.target).startsWith('/mnt/')) {
-    throw new Error(`Additional sandbox mounts must target /mnt/: ${mount.target}`);
+  const target = normalize(mount.target);
+  const isGeneralReadMount = isAbsolute(target) && target.startsWith('/mnt/');
+  const isDependencyMount = target === '/workspace/node_modules';
+  if (!isGeneralReadMount && !isDependencyMount) {
+    throw new Error(
+      `Additional sandbox mounts must target /mnt/ or the isolated dependency path /workspace/node_modules: ${mount.target}`,
+    );
   }
   if (mount.writable) {
     throw new Error('Additional sandbox mounts are read-only in sandbox protocol 1.');
