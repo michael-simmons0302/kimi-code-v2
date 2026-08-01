@@ -39,6 +39,7 @@ export interface CLIOptions {
   continue: boolean;
   yolo: boolean;
   auto: boolean;
+  evolve: boolean;
   plan: boolean;
   model: string | undefined;
   outputFormat: PromptOutputFormat | undefined;
@@ -84,6 +85,11 @@ export function validateOptions(
   }
   if (promptMode && opts.plan) {
     throw new OptionConflictError('Cannot combine --prompt with --plan.');
+  }
+  if (opts.evolve && opts.plan) {
+    throw new OptionConflictError(
+      'Cannot combine --evolve with --plan. Evolve mode performs evaluations and may execute candidate changes.',
+    );
   }
   if (opts.agent !== undefined && opts.agent.trim().length === 0) {
     throw new OptionConflictError('Agent cannot be empty.');
