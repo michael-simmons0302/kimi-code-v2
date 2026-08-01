@@ -1,13 +1,9 @@
 /**
  * `sessionExport` domain — session diagnostic export contract.
- *
- * Defines the App-scope `ISessionExportService`, which packages a persisted
- * session directory plus optional global diagnostics into a zip archive. The
- * service coordinates live Session/Agent scope flushing before reading the
- * on-disk state, while the export manifest stays a JSON data contract.
  */
 
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
+import type { AdaptiveExportManifest } from './adaptiveExport';
 
 export interface ShellEnvironment {
   readonly term?: string | undefined;
@@ -46,6 +42,8 @@ export interface ExportSessionManifest {
   readonly desktopVersion?: string;
   readonly installSource?: string | undefined;
   readonly shellEnv?: ShellEnvironment | undefined;
+  readonly adaptiveExport?: AdaptiveExportManifest;
+  readonly adaptiveExclusionReportPath?: string;
 }
 
 export interface ExportSessionResult {
