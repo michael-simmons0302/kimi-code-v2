@@ -23,6 +23,15 @@ import {
 
 const MANIFEST_KEY = 'manifest/adaptive-export-manifest.json';
 const ARCHITECTURE_VERSION = 'evolve-architecture/1';
+const EXCLUDED_PATH_FRAGMENTS = Object.freeze([
+  'adaptive/workspaces',
+  'adaptive/ephemeral-agents',
+  'adaptive/hidden-promotion',
+  'adaptive/promotion/hidden',
+  'adaptive/protected-evaluator',
+  'adaptive/evaluations/hidden',
+  'credentials',
+]);
 
 export class SessionAdaptiveExportService
   extends Disposable
@@ -103,7 +112,12 @@ export class SessionAdaptiveExportService
       manifestHash: hashCanonical(manifestBase),
     });
     await this.documents.set(this.scope, MANIFEST_KEY, manifest);
-    return { manifest, excludedArtifactHashes, retainedArtifactHashes };
+    return {
+      manifest,
+      excludedArtifactHashes,
+      retainedArtifactHashes,
+      excludedPathFragments: EXCLUDED_PATH_FRAGMENTS,
+    };
   }
 
   manifest(): Promise<AdaptiveExportManifest | undefined> {
