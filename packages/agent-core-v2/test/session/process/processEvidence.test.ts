@@ -53,6 +53,21 @@ describe('createProcessEvidence', () => {
     expect(verifyProcessEvidence(materialized)).toBe(true);
   });
 
+  it('preserves caller-supplied interleaving independently of stream totals', () => {
+    const combined = Uint8Array.from([0xf0, 0x9f, 0x78, 0x98, 0x80]);
+    const materialized = createProcessEvidence({
+      ...input(),
+      stdout: Uint8Array.from([0xf0, 0x9f, 0x98, 0x80]),
+      stderr: Uint8Array.from([0x78]),
+      combined,
+      modelOutputBytes: 1,
+    });
+    expect([...materialized.artifacts.combined]).toEqual([...combined]);
+    expect(materialized.envelope.combined.byteLength).toBe(5);
+    expect(materialized.envelope.modelOutputTruncated).toBe(true);
+    expect(verifyProcessEvidence(materialized)).toBe(true);
+  });
+
   it('hashes environment variables independent of property order', () => {
     const first = createProcessEvidence(input());
     const second = createProcessEvidence({
