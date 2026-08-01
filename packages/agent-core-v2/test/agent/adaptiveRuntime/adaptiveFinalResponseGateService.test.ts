@@ -1,15 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
 import { StateRegistry } from '#/_base/state/stateRegistry';
-import { OrderedHookSlot } from '#/hooks';
 import type { IAgentAdaptiveMemoryService } from '#/agent/adaptiveMemory/adaptiveMemory';
 import type { IAgentAdaptiveDirectiveService } from '#/agent/adaptivePrompt/adaptiveDirectiveService';
 import type { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
-import type {
-  AfterStepContext,
-  BeforeStepContext,
-  IAgentLoopService,
-} from '#/agent/loop/loop';
 import type { IAgentStateService } from '#/agent/state/agentState';
 import type { EvidenceId } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import type { IAgentAdaptiveRuntimeService } from '#/agent/adaptiveRuntime/adaptiveRuntime';
@@ -32,18 +26,6 @@ import type {
 import type { ISessionStructuralSignalsService } from '#/session/structuralSignals/structuralSignals';
 
 const EVIDENCE = 'verified-evidence' as EvidenceId;
-
-class FakeLoop {
-  readonly hooks = {
-    onWillBeginStep: new OrderedHookSlot<BeforeStepContext>(),
-    onDidFinishStep: new OrderedHookSlot<AfterStepContext>(),
-  };
-  readonly enqueued: unknown[] = [];
-  enqueue(request: unknown) {
-    this.enqueued.push(request);
-    return { assigned: Promise.resolve(undefined), abort: () => false };
-  }
-}
 
 class FakeRuntime {
   currentPhase = 'committing';
@@ -104,9 +86,7 @@ class FakeLedger implements ISessionEvaluationLedgerService {
   head(): EvaluationLedgerHead {
     return { protocol: 'adaptive-ledger/1', sequence: 1, recordHash: 'baseline' };
   }
-  async verify() {
-    return { valid: true, records: 1, head: this.head() };
-  }
+  async verify() { return { valid: true, records: 1, head: this.head() }; }
   async flush(): Promise<void> {}
 }
 
@@ -140,7 +120,6 @@ function verification(valid: boolean): FinalResponseVerification {
 }
 
 function fixture(results: FinalResponseVerification[]) {
-  const loop = new FakeLoop();
   const runtime = new FakeRuntime();
   const verifier = new FakeVerifier();
   verifier.results = [...results];
@@ -205,8 +184,7 @@ function fixture(results: FinalResponseVerification[]) {
   } as unknown as ISessionStructuralSignalsService;
   const states = new StateRegistry() as unknown as IAgentStateService;
 
-  new AgentAdaptiveFinalResponseGateService(
-    loop as unknown as IAgentLoopService,
+  const service = new AgentAdaptiveFinalResponseGateService(
     runtime as unknown as IAgentAdaptiveRuntimeService,
     directives,
     memory,
@@ -217,73 +195,46 @@ function fixture(results: FinalResponseVerification[]) {
     ledger,
     signals,
   );
-  return { loop, runtime, verifier, getDirective: () => directive, ledger };
-}
-
-function afterContext(): AfterStepContext {
-  return {
-    turnId: 1,
-    step: 2,
-    signal: new AbortController().signal,
-    usage: {
-      inputOther: 1,
-      output: 1,
-      inputCacheRead: 0,
-      inputCacheCreation: 0,
-    },
-    finishReason: 'completed',
-    stopTurn: false,
-  };
+  return { service, runtime, verifier, getDirective: () => directive, ledger };
 }
 
 describe('AgentAdaptiveFinalResponseGateService', () => {
-  it('blocks lower-priority preparation during a commit-only turn', async () => {
-    const { loop } = fixture([verification(true)]);
-    let lowerHookRan = false;
-    loop.hooks.onWillBeginStep.register('lower', async (_context, next) => {
-      lowerHookRan = true;
-      await next();
-    }, { priority: -1_000_000 });
-    await loop.hooks.onWillBeginStep.run({
-      turnId: 1,
-      step: 2,
-      signal: new AbortController().signal,
-    });
-    expect(lowerHookRan).toBe(false);
+  it('suppresses coordinator preparation only during the committing phase', () => {
+    const { service, runtime } = fixture([verification(true)]);
+    expect(service.allowCoordinatorPreparation()).toBe(false);
+    runtime.currentPhase = 'planning';
+    expect(service.allowCoordinatorPreparation()).toBe(true);
   });
 
-  it('allows a valid response to continue to reconciliation', async () => {
-    const { loop, verifier } = fixture([verification(true)]);
-    let reconciliationRan = false;
-    loop.hooks.onDidFinishStep.register('reconciliation', async (_context, next) => {
-      reconciliationRan = true;
-      await next();
-    }, { priority: 1_000_000 });
-    await loop.hooks.onDidFinishStep.run(afterContext());
-    expect(reconciliationRan).toBe(true);
+  it('returns verified with the exact changed-file plan', async () => {
+    const { service, verifier, getDirective } = fixture([verification(true)]);
+    const result = await service.verifyAfterStep();
+    expect(result.kind).toBe('verified');
     expect(verifier.plans[0]?.changedFiles).toEqual(['src/a.ts']);
+    expect(getDirective()).toBeUndefined();
   });
 
-  it('enqueues exactly one correction and blocks reconciliation', async () => {
-    const { loop, getDirective } = fixture([verification(false)]);
-    let reconciliationRan = false;
-    loop.hooks.onDidFinishStep.register('reconciliation', async (_context, next) => {
-      reconciliationRan = true;
-      await next();
-    }, { priority: 1_000_000 });
-    await loop.hooks.onDidFinishStep.run(afterContext());
-    expect(reconciliationRan).toBe(false);
-    expect(loop.enqueued).toHaveLength(1);
+  it('requests exactly one bounded correction', async () => {
+    const { service, getDirective } = fixture([verification(false)]);
+    const result = await service.verifyAfterStep();
+    expect(result.kind).toBe('correction-required');
     expect(getDirective()).toContain('Rewrite the final response once');
   });
 
-  it('rejects commit after a second invalid response', async () => {
-    const { loop, runtime } = fixture([verification(false), verification(false)]);
-    await loop.hooks.onDidFinishStep.run(afterContext());
-    const second = afterContext();
-    await loop.hooks.onDidFinishStep.run(second);
-    expect(loop.enqueued).toHaveLength(1);
+  it('rejects commit after the correction also fails', async () => {
+    const { service, runtime, getDirective } = fixture([
+      verification(false),
+      verification(false),
+    ]);
+    expect((await service.verifyAfterStep()).kind).toBe('correction-required');
+    expect((await service.verifyAfterStep()).kind).toBe('rejected');
     expect(runtime.failure?.phase).toBe('commit-rejected');
-    expect(second.stopTurn).toBe(true);
+    expect(getDirective()).toBeUndefined();
+  });
+
+  it('is not applicable outside the committing phase', async () => {
+    const { service, runtime } = fixture([]);
+    runtime.currentPhase = 'planning';
+    expect(await service.verifyAfterStep()).toEqual({ kind: 'not-applicable' });
   });
 });
