@@ -9,7 +9,7 @@ import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory'
 import { IAgentLoopService } from '#/agent/loop/loop';
 import { ContinuationStepRequest } from '#/agent/loop/stepRequest';
 import { IAgentStateService } from '#/agent/state/agentState';
-import type { EvidenceId } from './adaptiveProtocol';
+import { createEvidenceId } from './adaptiveProtocol';
 import { IAgentAdaptiveRuntimeService } from './adaptiveRuntime';
 import {
   FINAL_RESPONSE_PROTOCOL,
@@ -196,11 +196,10 @@ export class AgentAdaptiveFinalResponseGateService
     verification: FinalResponseVerification,
     plan: FinalResponsePlan,
   ): Promise<void> {
-    const evidenceId = crypto.randomUUID() as EvidenceId;
     await this.ledger.append({
       recordType: 'final.claim.verified',
       adaptiveRunId: this.runtime.runId(),
-      evidenceId,
+      evidenceId: createEvidenceId(),
       payload: {
         protocol: FINAL_RESPONSE_PROTOCOL,
         valid: verification.valid,
