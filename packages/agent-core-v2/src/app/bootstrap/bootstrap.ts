@@ -1,20 +1,5 @@
 /**
  * `bootstrap` domain — frozen startup snapshot and composition root.
- *
- * Defines the `IBootstrapService`, the snapshot of the world the process runs
- * in, resolved once at startup and frozen for the process: observed host facts
- * (`platform`, `arch`, `cwd`, `osHomeDir`, `getEnv`, `clientIdentity`), the
- * app path layout (`homeDir`, `configPath`, …), and the host's process-level
- * invocation arguments (`args` — mirroring VS Code's `NativeParsedArgs`
- * carried on the environment service: the host states them once in
- * `BootstrapInput`; downstream services read them here instead of through
- * per-domain runtime-options services). `resolveBootstrapOptions` is
- * the single place that reads `process.env` / `os.homedir()` / invocation
- * input to resolve the snapshot; everything downstream reads from
- * `IBootstrapService` instead of touching `process` directly. Bound at App
- * scope. Also seeds the `IFileSystemStorageService` with a `FileStorageService`
- * rooted at `homeDir` so the byte layer (and every Store above it) persists
- * to disk.
  */
 
 import { mkdirSync } from 'node:fs';
@@ -27,15 +12,14 @@ import type { KimiHostIdentity } from '@moonshot-ai/kimi-code-oauth';
 import { SyncDescriptor } from '#/_base/di/descriptors';
 import { createDecorator, type ServiceIdentifier } from '#/_base/di/instantiation';
 import { createAppScope, type Scope, type ScopeSeed } from '#/_base/di/scope';
-import {
-  IFileSystemStorageService,
-} from '#/persistence/interface/storage';
-import { FileStorageService } from '#/persistence/backends/node-fs/fileStorageService';
 import { FileSkillDiscovery } from '#/app/skillCatalog/fileSkillDiscovery';
 import { ISkillDiscovery } from '#/app/skillCatalog/skillDiscovery';
+import { FileStorageService } from '#/persistence/backends/node-fs/fileStorageService';
+import { IFileSystemStorageService } from '#/persistence/interface/storage';
 
 export type AdaptiveHostMode = 'disabled' | 'enabled';
 
+const ADAPTIVE_HOST_MODE_GLOBAL = '__KIMI_CODE_ADAPTIVE_HOST_MODE__';
 const adaptiveHostModeOverrides: AdaptiveHostMode[] = [];
 
 /**
@@ -57,43 +41,20 @@ function currentAdaptiveHostModeOverride(): AdaptiveHostMode | undefined {
   return adaptiveHostModeOverrides.at(-1);
 }
 
-/**
- * Host invocation arguments — process-level overrides the embedding host
- * states once at startup (mirrors VS Code's `NativeParsedArgs` carried on the
- * environment service). Resolved from {@link HostArgsInput} and read via
- * `IBootstrapService.args`.
- */
+function processAdaptiveHostMode(): AdaptiveHostMode | undefined {
+  const value = (globalThis as Record<string, unknown>)[ADAPTIVE_HOST_MODE_GLOBAL];
+  return value === 'enabled' || value === 'disabled' ? value : undefined;
+}
+
 export interface HostArgs {
-  /**
-   * Explicit agent definition files for this process (the CLI's
-   * `--agent-file`): loaded as the highest-priority `explicit` agent-profile
-   * source. Undefined means no explicit files.
-   */
   readonly agentFiles?: readonly string[];
-  /**
-   * Explicit skill directories for this process (v1's SDK `skillDirs`): when
-   * non-empty, default user / project skill discovery is skipped and these
-   * directories serve as the user skill source.
-   */
   readonly skillDirs?: readonly string[];
-  /**
-   * Host identity headers applied to outbound provider requests (User-Agent +
-   * `X-Msh-*`, built by the host through `createKimiDefaultHeaders`).
-   * Materialized to `{}` when the host passes none.
-   */
   readonly requestHeaders: Readonly<Record<string, string>>;
-  /** Fills the `${product_name}` slot in the base system-prompt template. */
   readonly displayName?: string;
-  /** Replaces the `${reply_style_guide}` block in the base system prompt. */
   readonly replyStyleGuide?: string;
-  /**
-   * Invocation-scoped adaptive execution mode. Artifacts may persist with a
-   * session, but search and evaluation run only while this host mode is enabled.
-   */
   readonly adaptiveMode: AdaptiveHostMode;
 }
 
-/** {@link HostArgs} as accepted from the host: required fields may be omitted. */
 export interface HostArgsInput {
   readonly agentFiles?: readonly string[];
   readonly skillDirs?: readonly string[];
@@ -110,7 +71,11 @@ export function resolveHostArgs(input: HostArgsInput | undefined): HostArgs {
     requestHeaders: input?.requestHeaders ?? {},
     displayName: input?.displayName,
     replyStyleGuide: input?.replyStyleGuide,
-    adaptiveMode: input?.adaptiveMode ?? currentAdaptiveHostModeOverride() ?? 'disabled',
+    adaptiveMode:
+      input?.adaptiveMode ??
+      currentAdaptiveHostModeOverride() ??
+      processAdaptiveHostMode() ??
+      'disabled',
   };
 }
 
@@ -142,7 +107,6 @@ export type PersistenceScopeName =
 
 export interface IBootstrapService {
   readonly _serviceBrand: undefined;
-
   readonly platform: NodeJS.Platform;
   readonly arch: string;
   readonly cwd: string;
@@ -150,7 +114,6 @@ export interface IBootstrapService {
   readonly homeDir: string;
   readonly configPath: string;
   readonly clientIdentity: KimiHostIdentity;
-  /** Host invocation arguments; see {@link HostArgs}. */
   readonly args: HostArgs;
   readonly sessionsDir: string;
   readonly blobsDir: string;
@@ -173,10 +136,7 @@ export interface BootstrapInput {
   readonly platform?: NodeJS.Platform;
   readonly arch?: string;
   readonly cwd?: string;
-  /** Required: every process names its host. There is deliberately no default
-      — a fabricated identity would silently misreport the host upstream. */
   readonly clientIdentity: KimiHostIdentity;
-  /** Host invocation arguments; see {@link HostArgsInput}. */
   readonly args?: HostArgsInput;
 }
 
@@ -217,18 +177,11 @@ export function bootstrap(input: BootstrapInput, extraSeeds: ScopeSeed = []): Bo
 function storageSeed(options: IBootstrapOptions): ScopeSeed {
   const file = (): SyncDescriptor<IFileSystemStorageService> =>
     new SyncDescriptor(FileStorageService, [options.homeDir, 0o700, 0o600]);
-  return [
-    [IFileSystemStorageService as ServiceIdentifier<unknown>, file()],
-  ];
+  return [[IFileSystemStorageService as ServiceIdentifier<unknown>, file()]];
 }
 
 function skillSeed(): ScopeSeed {
-  return [
-    [
-      ISkillDiscovery as ServiceIdentifier<unknown>,
-      new SyncDescriptor(FileSkillDiscovery, []),
-    ],
-  ];
+  return [[ISkillDiscovery as ServiceIdentifier<unknown>, new SyncDescriptor(FileSkillDiscovery, [])]];
 }
 
 export function resolveKimiHome(
