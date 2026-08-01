@@ -3,10 +3,7 @@
  *
  * The master switch `KIMI_CODE_EXPERIMENTAL_FLAG` keeps its existing behavior:
  * it routes the CLI through v2 and enables the engine's experimental features.
- * `--evolve` also requires v2, but it must not enable unrelated experiments, so
- * callers pass the invocation-scoped option explicitly through `shouldUseKimiV2`.
- *
- * Note: `kimi web` always boots kap-server (the agent-core-v2 engine server).
+ * `--evolve` also requires v2, but it must not enable unrelated experiments.
  */
 
 import type { CLIOptions } from './options';
@@ -14,6 +11,7 @@ import type { CLIOptions } from './options';
 export const KIMI_V2_ENV = 'KIMI_CODE_EXPERIMENTAL_FLAG';
 
 const TRUTHY_VALUES = new Set(['1', 'true', 'yes', 'on']);
+let invocationOverride = false;
 
 function isTruthyEnv(
   key: string,
@@ -22,15 +20,20 @@ function isTruthyEnv(
   return TRUTHY_VALUES.has((env[key] ?? '').trim().toLowerCase());
 }
 
+/** Set once by the CLI entrypoint after option validation. */
+export function setKimiV2InvocationOverride(enabled: boolean): void {
+  invocationOverride = enabled;
+}
+
 export function isKimiV2Enabled(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
-  return isTruthyEnv(KIMI_V2_ENV, env);
+  return invocationOverride || isTruthyEnv(KIMI_V2_ENV, env);
 }
 
 export function shouldUseKimiV2(
   options: Pick<CLIOptions, 'evolve'>,
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
-  return options.evolve || isKimiV2Enabled(env);
+  return options.evolve || isTruthyEnv(KIMI_V2_ENV, env);
 }
