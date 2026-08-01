@@ -36,6 +36,27 @@ import { ISkillDiscovery } from '#/app/skillCatalog/skillDiscovery';
 
 export type AdaptiveHostMode = 'disabled' | 'enabled';
 
+const adaptiveHostModeOverrides: AdaptiveHostMode[] = [];
+
+/**
+ * Apply an invocation-scoped adaptive-mode default while a host constructs a
+ * v2 client. The callback must be synchronous: bootstrap freezes the resolved
+ * value before this function unwinds, and the stack prevents nested hosts from
+ * leaking state into one another.
+ */
+export function withAdaptiveHostMode<T>(mode: AdaptiveHostMode, callback: () => T): T {
+  adaptiveHostModeOverrides.push(mode);
+  try {
+    return callback();
+  } finally {
+    adaptiveHostModeOverrides.pop();
+  }
+}
+
+function currentAdaptiveHostModeOverride(): AdaptiveHostMode | undefined {
+  return adaptiveHostModeOverrides.at(-1);
+}
+
 /**
  * Host invocation arguments — process-level overrides the embedding host
  * states once at startup (mirrors VS Code's `NativeParsedArgs` carried on the
@@ -89,7 +110,7 @@ export function resolveHostArgs(input: HostArgsInput | undefined): HostArgs {
     requestHeaders: input?.requestHeaders ?? {},
     displayName: input?.displayName,
     replyStyleGuide: input?.replyStyleGuide,
-    adaptiveMode: input?.adaptiveMode ?? 'disabled',
+    adaptiveMode: input?.adaptiveMode ?? currentAdaptiveHostModeOverride() ?? 'disabled',
   };
 }
 
