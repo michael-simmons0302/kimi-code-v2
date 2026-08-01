@@ -18,7 +18,7 @@ export const AdaptiveModelRolesSchema = z.object({
   policyValue: z.string().min(1).optional(),
   finalResponsePlanning: z.string().min(1).optional(),
   finalClaimVerification: z.string().min(1).optional(),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveBudgetSchema = z.object({
   maxInternalRequests: PositiveInteger.default(128),
@@ -31,7 +31,7 @@ export const AdaptiveBudgetSchema = z.object({
   maxCpuMs: PositiveInteger.default(14_400_000),
   maxDiskBytes: PositiveInteger.default(20 * 1024 * 1024 * 1024),
   maxCandidates: PositiveInteger.default(256),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveEvaluationSchema = z.object({
   maximumParallel: PositiveInteger.default(4),
@@ -43,7 +43,7 @@ export const AdaptiveEvaluationSchema = z.object({
   deterministicCache: z.boolean().default(true),
   confirmationReserveFraction: z.number().min(0.05).max(0.5).default(0.2),
   timeoutOverridesMs: z.record(z.string().min(1), PositiveInteger).default({}),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveWorldModelSchema = z.object({
   minimumPopulation: PositiveInteger.default(3),
@@ -55,7 +55,7 @@ export const AdaptiveWorldModelSchema = z.object({
   maximumSimulationDepth: PositiveInteger.default(64),
   minimumPosteriorWeightForFrontier: Probability.default(0.005),
   minimumEffectiveSampleSize: z.number().min(1).default(2.5),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveSearchSchema = z.object({
   cPuct: z.number().positive().default(1.5),
@@ -73,7 +73,7 @@ export const AdaptiveSearchSchema = z.object({
   maximumDiscoveryWeight: Probability.default(0.6),
   discoveryBonusCapFraction: Probability.default(0.3),
   actionCategoryMaximumFraction: z.number().gt(0).lte(1).default(0.5),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveEvolutionSchema = z.object({
   maximumCandidatesPerRequest: PositiveInteger.default(16),
@@ -83,7 +83,7 @@ export const AdaptiveEvolutionSchema = z.object({
   islandCount: PositiveInteger.default(8),
   migrationInterval: PositiveInteger.default(50),
   protectedPromotionWindows: PositiveInteger.default(2),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveSandboxSchema = z.object({
   backend: z.enum(['auto', 'linux-bwrap', 'windows-wsl-bwrap', 'mac-oci']).default('auto'),
@@ -96,7 +96,7 @@ export const AdaptiveSandboxSchema = z.object({
   outputBytes: PositiveInteger.default(64 * 1024 * 1024),
   networkBytes: PositiveInteger.default(64 * 1024 * 1024),
   retainFailedWorkspaces: z.boolean().default(true),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveMemorySchema = z.object({
   activeContextTokens: PositiveInteger.default(16_384),
@@ -104,14 +104,14 @@ export const AdaptiveMemorySchema = z.object({
   preserveExactDiagnostics: z.boolean().default(true),
   preserveDecisiveCounterexamples: z.boolean().default(true),
   maximumSummaryTokens: PositiveInteger.default(2_048),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveSignalsSchema = z.object({
   queueCapacity: PositiveInteger.default(10_000),
   coalesceThresholdFraction: z.number().gt(0).lt(1).default(0.8),
   fileDebounceMs: NonNegativeInteger.default(100),
   maximumConflictSuggestions: PositiveInteger.default(16),
-}).default({});
+}).strict().prefault({});
 
 export const AdaptiveConfigSchema = z.object({
   enabledByDefault: z.literal(false).default(false),
@@ -124,7 +124,7 @@ export const AdaptiveConfigSchema = z.object({
   sandbox: AdaptiveSandboxSchema,
   memory: AdaptiveMemorySchema,
   signals: AdaptiveSignalsSchema,
-}).superRefine((value, context) => {
+}).strict().superRefine((value, context) => {
   if (value.evaluation.maximumReplicates < value.evaluation.minimumReplicates) {
     context.addIssue({
       code: 'custom',
