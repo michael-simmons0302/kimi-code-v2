@@ -6,6 +6,8 @@
  * `--evolve` also requires v2, but it must not enable unrelated experiments.
  */
 
+import '@moonshot-ai/program-evolution/register';
+
 import type { CLIOptions } from './options';
 
 export const KIMI_V2_ENV = 'KIMI_CODE_EXPERIMENTAL_FLAG';
