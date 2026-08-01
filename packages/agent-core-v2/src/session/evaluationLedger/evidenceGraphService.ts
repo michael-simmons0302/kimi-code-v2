@@ -293,8 +293,8 @@ function nodeTypeForRecord(
   switch (recordType) {
     case 'request.recorded': return 'request';
     case 'tool.call.recorded': return 'tool-call';
-    case 'tool.result.recorded':
-      return payload['process'] === true ? 'process-execution' : 'tool-result';
+    case 'tool.result.recorded': return 'tool-result';
+    case 'process.execution.recorded': return 'process-execution';
     case 'baseline.captured': return 'workspace-snapshot';
     case 'evaluation.started':
     case 'evaluation.completed': return 'evaluation';
