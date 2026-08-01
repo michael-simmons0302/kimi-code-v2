@@ -65,6 +65,7 @@
     "@moonshot-ai/kimi-code-oauth": "workspace:^",
     "@moonshot-ai/klient": "workspace:^",
     "@moonshot-ai/kosong": "workspace:^",
+    "@moonshot-ai/program-evolution": "workspace:^",
     "@types/yazl": "^2.4.6",
     "jimp": "^1.6.1"
   }
