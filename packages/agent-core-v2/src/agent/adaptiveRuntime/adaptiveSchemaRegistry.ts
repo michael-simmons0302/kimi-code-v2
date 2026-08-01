@@ -123,7 +123,7 @@ class AdaptiveSchemaRegistry {
     return this.get(protocol).schema.parse(value) as TOutput;
   }
 
-  safeParse(protocol: string, value: unknown): z.SafeParseReturnType<unknown, unknown> {
+  safeParse(protocol: string, value: unknown): z.ZodSafeParseResult<unknown> {
     return this.get(protocol).schema.safeParse(value);
   }
 
