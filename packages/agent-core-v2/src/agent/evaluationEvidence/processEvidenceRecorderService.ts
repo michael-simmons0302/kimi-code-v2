@@ -1,8 +1,12 @@
-import { createDecorator } from '#/_base/di/instantiation';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { createEvidenceId, type EvidenceId } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import { IAgentAdaptiveRuntimeService } from '#/agent/adaptiveRuntime/adaptiveRuntime';
-import type { LLMRequestTrace } from '#/kosong/contract/requestTrace';
+import {
+  IAgentProcessEvidenceRecorderImplementation,
+  type IAgentProcessEvidenceRecorderService,
+  type ProcessEvidenceRecorder,
+  type ProcessEvidenceStart,
+} from '#/agent/evaluationEvidence/processEvidenceRecorder';
 import { requestIdForTrace } from '#/kosong/contract/requestTrace';
 import { IBlobStore } from '#/persistence/interface/blobStore';
 import {
@@ -13,40 +17,6 @@ import {
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
 import type { ToolEvidenceEnvelope } from '#/tool/toolContract';
-
-export interface ProcessEvidenceStart {
-  readonly command: readonly string[] | string;
-  readonly shell: boolean;
-  readonly cwd: string;
-  readonly environment: Readonly<Record<string, string>>;
-  readonly background: boolean;
-  readonly toolCallId: string;
-  readonly trace?: LLMRequestTrace;
-}
-
-export interface ProcessEvidenceSettlement {
-  readonly exitCode: number | null;
-  readonly terminationSignal?: string;
-  readonly timedOut: boolean;
-  readonly cancelled: boolean;
-  readonly modelOutputBytes?: number;
-}
-
-export interface ProcessEvidenceRecorder {
-  setTaskId(taskId: string): void;
-  append(kind: 'stdout' | 'stderr', bytes: Uint8Array): void;
-  settle(settlement: ProcessEvidenceSettlement): Promise<ToolEvidenceEnvelope | undefined>;
-}
-
-export interface IAgentProcessEvidenceRecorderService {
-  readonly _serviceBrand: undefined;
-  start(input: ProcessEvidenceStart): ProcessEvidenceRecorder;
-}
-
-export const IAgentProcessEvidenceRecorderService =
-  createDecorator<IAgentProcessEvidenceRecorderService>(
-    'agentProcessEvidenceRecorderService',
-  );
 
 export class AgentProcessEvidenceRecorderService
   implements IAgentProcessEvidenceRecorderService
@@ -191,8 +161,8 @@ function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 registerScopedService(
   LifecycleScope.Agent,
-  IAgentProcessEvidenceRecorderService,
+  IAgentProcessEvidenceRecorderImplementation,
   AgentProcessEvidenceRecorderService,
   ScopeActivation.OnDemand,
-  'processEvidenceRecorder',
+  'processEvidenceRecorderImplementation',
 );
