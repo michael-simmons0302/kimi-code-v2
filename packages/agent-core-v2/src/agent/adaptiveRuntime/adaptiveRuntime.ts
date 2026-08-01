@@ -1,4 +1,5 @@
 import { createDecorator } from '#/_base/di/instantiation';
+import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import type { AdaptivePromptPhase } from '#/agent/adaptivePrompt/adaptivePromptLibrary';
 import type {
   AdaptiveCost,
@@ -41,4 +42,28 @@ export interface IAgentAdaptiveRuntimeService {
 
 export const IAgentAdaptiveRuntimeService = createDecorator<IAgentAdaptiveRuntimeService>(
   'agentAdaptiveRuntimeService',
+);
+
+/** Default binding used when the host did not load Evolve registrations. */
+export class DisabledAgentAdaptiveRuntimeService implements IAgentAdaptiveRuntimeService {
+  declare readonly _serviceBrand: undefined;
+
+  enabled(): boolean { return false; }
+  runId(): AdaptiveRunId | undefined { return undefined; }
+  ensureRun(): AdaptiveRunId | undefined { return undefined; }
+  phase(): AdaptivePhase { return 'inactive'; }
+  transition(): AdaptivePhaseTransition | undefined { return undefined; }
+  promptPhase(): AdaptivePromptPhase | undefined { return undefined; }
+  update(): void {}
+  status(): AdaptiveStatusSnapshot | undefined { return undefined; }
+  complete(): void {}
+  fail(): void {}
+}
+
+registerScopedService(
+  LifecycleScope.Agent,
+  IAgentAdaptiveRuntimeService,
+  DisabledAgentAdaptiveRuntimeService,
+  ScopeActivation.OnDemand,
+  'adaptiveRuntimeDisabled',
 );
