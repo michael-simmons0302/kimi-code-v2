@@ -27,7 +27,8 @@ import {
   type EvidenceId,
 } from './adaptiveProtocol';
 import {
-  IAgentAdaptiveCoordinatorService,
+  IAgentAdaptiveCoordinatorImplementation,
+  type IAgentAdaptiveCoordinatorService,
   type AdaptiveObserveStepContext,
   type AdaptiveObserveStepDecision,
   type AdaptivePrepareStepContext,
@@ -359,61 +360,34 @@ export class AgentAdaptiveCoordinatorService
         { target: 'tests', operation: 'invalidate' },
       ],
       evidence,
-      'repository',
     );
     await this.proposeRepositoryRule(
       nodes
         .filter((node) =>
-          ['wire-model', 'wire-operation', 'persistence-schema'].includes(node.kind),
+          ['config-section', 'persistence-shape', 'generated-artifact'].includes(node.kind),
         )
         .map((node) => node.id),
       'change-persisted-contract',
       [
-        { target: 'restore', operation: 'invalidate' },
-        { target: 'replay', operation: 'invalidate' },
-        { target: 'export', operation: 'invalidate' },
+        { target: 'compatibility', operation: 'invalidate' },
+        { target: 'generated-manifests', operation: 'invalidate' },
+        { target: 'round-trip-tests', operation: 'invalidate' },
       ],
       evidence,
-      'repository',
-    );
-    await this.proposeRepositoryRule(
-      nodes
-        .filter((node) =>
-          ['event-type', 'event-publisher', 'event-subscriber'].includes(node.kind),
-        )
-        .map((node) => node.id),
-      'change-event-contract',
-      [
-        { target: 'publishers', operation: 'invalidate' },
-        { target: 'subscribers', operation: 'invalidate' },
-        { target: 'event-order', operation: 'invalidate' },
-      ],
-      evidence,
-      'runtime',
-    );
-    await this.proposeRepositoryRule(
-      nodes
-        .filter((node) => node.kind === 'generated-artifact')
-        .map((node) => node.id),
-      'change-generated-source',
-      [{ target: 'generated-artifacts', operation: 'invalidate' }],
-      evidence,
-      'repository',
     );
   }
 
   private async proposeRepositoryRule(
     subjectRefs: readonly string[],
-    actionType: string,
-    predictedEffects: Parameters<IAgentCausalRuleGraphService['propose']>[0]['predictedEffects'],
+    action: string,
+    predictedEffects: readonly { readonly target: string; readonly operation: 'invalidate' }[],
     supportingEvidenceRefs: readonly string[],
-    scope: 'repository' | 'runtime',
   ): Promise<void> {
     if (subjectRefs.length === 0) return;
     await this.rules.propose({
-      scope,
-      condition: { expression: { changedStructures: subjectRefs } },
-      intervention: { action: { type: actionType } },
+      scope: 'repository',
+      condition: { expression: { anySubjectChanges: subjectRefs } },
+      intervention: { action: { type: action } },
       predictedEffects,
       subjectRefs,
       supportingEvidenceRefs,
@@ -422,122 +396,70 @@ export class AgentAdaptiveCoordinatorService
 
   private async ensureWorldModelPopulation(
     signal: AbortSignal,
-    forceExpansion: boolean,
+    forceAlternative: boolean,
   ): Promise<void> {
     const active = this.worldModels.activeCandidates();
-    if (!forceExpansion && active.length >= 3) return;
-    const kind =
-      active.length === 0
-        ? 'propose'
-        : forceExpansion
-          ? 'expand-state-abstraction'
-          : 'adversarial-alternative';
-    const proposed = await this.evolution.evolve(
+    if (active.length >= 2 && !forceAlternative) return;
+    const ruleSnapshot = this.rules.snapshot();
+    const evidenceHead = this.ledger.head().recordHash ?? 'genesis';
+    const kind = forceAlternative ? 'adversarial-alternative' : 'propose';
+    const result = await this.evolution.evolve(
       {
         kind,
         objective: this.currentObjective(),
-        observations: [this.structureSummary(), this.memorySummary()],
-        counterexamples: this.worldModels.list('rejected').map((candidate) => ({
-          candidateId: candidate.manifest.candidateId,
-          reason: candidate.rejectionReason,
-          evaluationRefs: candidate.evaluationRefs,
-        })),
+        observations: await this.compactObservations(),
+        counterexamples: [],
         conflicts: this.signals.conflicts('open'),
-        ruleIds: this.rules.list().map((rule) => rule.ruleId),
-        parentCandidateIds: this.worldModels
-          .list()
-          .map((candidate) => candidate.manifest.candidateId),
-        parentCandidates: this.worldModels.list(),
-        ruleGraphHash: this.rules.snapshot().hash,
-        stateSchemaHash: hashText('adaptive-state-schema/1'),
-        actionSchemaHash: hashText('adaptive-action-schema/1'),
-        observationSchemaHash: hashText('adaptive-observation-schema/1'),
-        evidenceHead: this.ledger.head().recordHash ?? '',
-        maximumCandidates: Math.max(
-          3,
-          Math.min(8, DEFAULT_ADAPTIVE_BUDGET.maxCandidates),
-        ),
+        ruleIds: ruleSnapshot.rules.map((rule) => rule.ruleId),
+        parentCandidateIds: active.map((candidate) => candidate.manifest.candidateId),
+        parentCandidates: active,
+        ruleGraphHash: ruleSnapshot.hash,
+        stateSchemaHash: hashValue('adaptive-state/1'),
+        actionSchemaHash: hashValue('adaptive-action/1'),
+        observationSchemaHash: hashValue('adaptive-observation/1'),
+        evidenceHead,
+        maximumCandidates: forceAlternative ? 2 : 4,
       },
       signal,
     );
-
-    for (const bundle of proposed.candidates) {
-      try {
-        const candidate = await this.worldModels.propose({
-          source: bundle.source,
-          ruleIds: bundle.ruleIds,
-          parentCandidateIds: bundle.parentCandidateIds,
-          ruleGraphHash: this.rules.snapshot().hash,
-          stateSchemaHash: hashText('adaptive-state-schema/1'),
-          actionSchemaHash: hashText('adaptive-action-schema/1'),
-          observationSchemaHash: hashText('adaptive-observation-schema/1'),
-          deterministic: bundle.deterministic,
-          supportedEvaluatorIds: bundle.supportedEvaluatorIds,
-          evidenceHead: this.ledger.head().recordHash ?? '',
-        });
-        await this.validateCandidate(candidate, signal);
-      } catch (error) {
-        await this.ledger.append({
-          recordType: 'world_model.evaluated',
-          payload: {
-            sourceHash: hashText(bundle.source),
-            status: 'rejected',
-            error: error instanceof Error ? error.message : String(error),
-          },
-        });
-      }
+    for (const bundle of result.candidates) {
+      const candidate = await this.worldModels.propose({
+        source: bundle.source,
+        ruleIds: bundle.ruleIds,
+        parentCandidateIds: bundle.parentCandidateIds,
+        ruleGraphHash: ruleSnapshot.hash,
+        stateSchemaHash: hashValue('adaptive-state/1'),
+        actionSchemaHash: hashValue('adaptive-action/1'),
+        observationSchemaHash: hashValue('adaptive-observation/1'),
+        deterministic: bundle.deterministic,
+        supportedEvaluatorIds: bundle.supportedEvaluatorIds,
+        evidenceHead,
+      });
+      await this.ledger.append({
+        recordType: 'world_model.proposed',
+        adaptiveRunId: this.runtime.runId(),
+        payload: {
+          requestId: result.requestId,
+          providerTraceId: result.providerTraceId,
+          kind,
+          candidateId: candidate.manifest.candidateId,
+          parentCandidateIds: candidate.manifest.parentCandidateIds,
+          rationaleSummary: bundle.rationaleSummary,
+          sourceHash: candidate.manifest.sourceHash,
+        },
+      });
     }
-
-    if (this.worldModels.activeCandidates().length === 0) {
-      this.runtime.fail(
-        'no-viable-model',
-        'No generated causal model passed sandbox validation.',
-      );
-      throw new Error('No generated causal model passed sandbox validation.');
-    }
-  }
-
-  private async validateCandidate(
-    candidate: WorldModelCandidate,
-    signal: AbortSignal,
-  ): Promise<void> {
-    const observation = {
-      objective: this.currentObjective(),
-      structureHash: this.structure.snapshot()?.hash,
-      evidenceHead: this.ledger.head().recordHash,
-      conflicts: this.signals.conflicts('open'),
-    };
-    const encoded = await this.worldModels.invoke(
-      candidate.manifest.candidateId,
-      'encodeObservation',
-      [observation, { seed: candidate.manifest.sourceHash }],
-      { signal, timeoutMs: 10_000 },
-    );
-    const actions = await this.worldModels.invoke<unknown[]>(
-      candidate.manifest.candidateId,
-      'enumerateActions',
-      [encoded, { seed: candidate.manifest.sourceHash }],
-      { signal, timeoutMs: 10_000 },
-    );
-    if (!Array.isArray(actions)) {
-      await this.worldModels.setStatus(
-        candidate.manifest.candidateId,
-        'rejected',
-        'enumerateActions did not return an array.',
-      );
-      throw new Error('World model enumerateActions did not return an array.');
-    }
-    await this.worldModels.setStatus(candidate.manifest.candidateId, 'history-consistent');
-    await this.worldModels.setStatus(candidate.manifest.candidateId, 'planning-eligible');
+    this.runtime.update({ viableModels: this.worldModels.activeCandidates().length });
   }
 
   private async planUntilExternalAction(signal: AbortSignal): Promise<void> {
-    this.runtime.transition('planning', 'Selecting the next evaluation or task action.');
-    let nodeId = await this.search.begin(this.searchState());
-    for (let index = 0; index < MAX_INTERNAL_ACTIONS_PER_STEP; index += 1) {
+    for (let iteration = 0; iteration < MAX_INTERNAL_ACTIONS_PER_STEP; iteration += 1) {
       signal.throwIfAborted();
-      await this.search.addActions(nodeId, await this.generateActions(signal));
-      const selection = await this.search.select(nodeId);
+      const state = this.buildSearchState();
+      const rootId = await this.search.begin(state);
+      const actions = this.generateActions();
+      await this.search.addActions(rootId, actions);
+      const selection = await this.search.select(rootId);
       this.state = {
         ...this.state,
         lastSelection: {
@@ -547,504 +469,518 @@ export class AgentAdaptiveCoordinatorService
           nodeId: selection.nodeId,
         },
       };
-      switch (selection.action.kind) {
-        case 'inspect-structure':
-          nodeId = (await this.observeInternal(selection, 'inspected', 0.1)) ?? nodeId;
-          continue;
-        case 'run-evaluation':
-        case 'run-replicate':
-        case 'evaluate-task-patch':
-          nodeId = (await this.executeEvaluation(selection, signal)) ?? nodeId;
-          continue;
-        case 'revise-world-model':
-        case 'expand-world-model-population':
-          this.runtime.transition('modeling', selection.action.description);
-          await this.ensureWorldModelPopulation(signal, true);
-          nodeId =
-            (await this.observeInternal(selection, 'population-expanded', 0.15)) ??
-            nodeId;
-          this.runtime.transition('planning', 'World-model population updated.');
-          continue;
-        case 'construct-intervention':
-        case 'simulate-task-action':
-          nodeId = (await this.observeInternal(selection, 'simulated', 0.05)) ?? nodeId;
-          continue;
-        case 'propose-task-patch':
-        case 'execute-task-action':
-          this.runtime.transition('acting', selection.action.description);
-          this.directive.set(selection.action.description);
-          return;
-        case 'commit-solution':
-          this.runtime.transition('committing', 'Preparing the verified final response.');
-          this.directive.set(selection.action.description);
-          return;
+      const handled = await this.executeInternalAction(selection, signal);
+      if (!handled) {
+        this.runtime.transition('acting', selection.action.description);
+        this.directive.set(selection.action.description);
+        return;
       }
     }
-    this.runtime.transition(
-      'acting',
-      'Internal search budget reached; perform the highest-value reversible task action.',
+    this.runtime.fail(
+      'budget-exhausted',
+      `Internal adaptive action budget exceeded ${String(MAX_INTERNAL_ACTIONS_PER_STEP)} actions in one step.`,
     );
-    this.directive.set(
-      'Perform the highest-value reversible task action selected by the current evidence. Do not claim completion without verification.',
-    );
+    throw new Error('Adaptive internal action budget exhausted before a real task action was selected.');
   }
 
-  private async generateActions(signal: AbortSignal): Promise<readonly SearchAction[]> {
+  private generateActions(): readonly SearchAction[] {
+    const conflicts = this.signals
+      .conflicts('open')
+      .filter((conflict) => conflict.status === 'open');
     const actions: SearchAction[] = [];
-    for (const conflict of this.signals.conflicts('open').slice(0, 8)) {
-      actions.push(await this.evaluationActionForConflict(conflict, signal));
-    }
-    if (this.worldModels.activeCandidates().length < 3) {
-      actions.push(
-        baseAction({
-          actionId: 'expand-world-model-population',
-          kind: 'expand-world-model-population',
-          description:
-            'Generate additional executable causal models because the active epistemic ensemble is too small.',
-          payload: { reason: 'minimum-ensemble-size' },
-          prior: 0.5,
-          expectedTaskValue: 0.1,
-          expectedProgress: 0.15,
-          decisionSensitivity: 0.8,
-          generalizationLeverage: 0.7,
-        }),
+    for (const conflict of conflicts.slice(0, 4)) {
+      const evaluatorId = firstRegisteredEvaluator(
+        conflict.suggestedEvaluatorIds,
+        this.evaluators,
       );
+      if (evaluatorId === undefined) continue;
+      actions.push(this.conflictEvaluationAction(conflict, evaluatorId));
     }
-    actions.push(
-      await this.withPredictions(
-        baseAction({
-          actionId: 'execute-best-task-action',
-          kind: 'execute-task-action',
-          description:
-            'Advance the user task with the highest-value code action supported by the current causal rules. Trace cross-file effects and use ordinary KC permissions.',
-          payload: { objective: this.currentObjective() },
-          prior: 0.8,
-          expectedTaskValue: 0.5,
-          expectedProgress: 0.6,
-          decisionSensitivity: 0.9,
-          generalizationLeverage: 0.7,
-        }),
-        signal,
-      ),
-    );
-    actions.push(
-      await this.withPredictions(
-        baseAction({
-          actionId: 'commit-verified-solution',
-          kind: 'commit-solution',
-          description:
-            'Return only the completed change, decisive verification, and unresolved material risk. Do not include investigation history.',
-          payload: { verifiedCandidates: this.state.verifiedCandidates },
-          prior: this.state.verifiedCandidates > 0 ? 0.7 : 0.05,
-          expectedTaskValue: this.state.verifiedCandidates > 0 ? 0.8 : -0.5,
-          expectedProgress: 0,
-          decisionSensitivity: 1,
-          generalizationLeverage: 0,
-        }),
-        signal,
-      ),
-    );
+    for (const evaluator of this.evaluators.list().slice(0, 4)) {
+      if (actions.some((action) => action.actionId === `evaluate:${evaluator.evaluatorId}`)) continue;
+      actions.push({
+        actionId: `evaluate:${evaluator.evaluatorId}`,
+        kind: 'run-evaluation',
+        description: `Run evaluator ${evaluator.evaluatorId} on the current workspace.`,
+        payload: { evaluatorId: evaluator.evaluatorId },
+        prior: evaluator.level === 'validity' ? 0.95 : 0.6,
+        expectedTaskValue: evaluator.level === 'validity' ? 0.8 : 0.5,
+        expectedProgress: 0.7,
+        generalizationLeverage: evaluator.scale === 'repository' ? 0.8 : 0.4,
+        decisionSensitivity: 0.9,
+        calibrationFactor: evaluator.mode === 'deterministic' ? 1 : 0.7,
+        wallCost: evaluator.defaultTimeoutMs / 1_000,
+        tokenCost: 0,
+        toolCost: 1,
+        executionRisk: 0.05,
+        redundancyPenalty: 0,
+        hardGate: evaluator.level === 'validity',
+        predictions: this.predictionsForEvaluator(evaluator.evaluatorId),
+      });
+    }
+    if (this.worldModels.activeCandidates().length < 2) {
+      actions.push({
+        actionId: 'expand-world-model-population',
+        kind: 'expand-world-model-population',
+        description: 'Propose an independent alternative causal model before committing.',
+        payload: {},
+        prior: 0.9,
+        expectedTaskValue: 0.3,
+        expectedProgress: 0.4,
+        generalizationLeverage: 0.9,
+        decisionSensitivity: 0.8,
+        calibrationFactor: 0.6,
+        wallCost: 5,
+        tokenCost: 1,
+        toolCost: 0,
+        executionRisk: 0.05,
+        redundancyPenalty: 0,
+      });
+    }
+    actions.push({
+      actionId: 'execute-task-action',
+      kind: 'execute-task-action',
+      description: this.actionDirective(conflicts),
+      payload: {},
+      prior: 0.8,
+      expectedTaskValue: 0.9,
+      expectedProgress: 0.9,
+      generalizationLeverage: 0.5,
+      decisionSensitivity: 0.8,
+      calibrationFactor: 1,
+      wallCost: 1,
+      tokenCost: 1,
+      toolCost: 1,
+      executionRisk: 0.15,
+      redundancyPenalty: 0,
+      predictions: this.predictionsForTaskAction(),
+    });
     return actions;
   }
 
-  private async evaluationActionForConflict(
+  private conflictEvaluationAction(
     conflict: StructuralConflict,
-    signal: AbortSignal,
-  ): Promise<SearchAction> {
-    return this.withPredictions(
-      baseAction({
-        actionId: `evaluate-conflict:${conflict.conflictId}`,
-        kind: 'run-evaluation',
-        description: `Resolve ${conflict.kind}: ${conflict.message}`,
-        payload: {
-          evaluatorId: 'sandbox.command',
-          command: commandForConflict(conflict),
-          conflictId: conflict.conflictId,
-        },
-        prior: conflict.severity === 'commit-blocking' ? 1 : 0.7,
-        expectedTaskValue:
-          conflict.severity === 'commit-blocking' ? 0.5 : 0.25,
-        expectedProgress: 0.2,
-        decisionSensitivity:
-          conflict.severity === 'commit-blocking' ? 1 : 0.7,
-        generalizationLeverage:
-          conflict.kind === 'persistence-conflict' ||
-          conflict.kind === 'event-order-conflict'
-            ? 1
-            : 0.7,
-        hardGate: conflict.severity === 'commit-blocking',
-      }),
-      signal,
-    );
+    evaluatorId: string,
+  ): SearchAction {
+    return {
+      actionId: `conflict:${conflict.conflictId}:${evaluatorId}`,
+      kind: 'run-evaluation',
+      description: `Resolve ${conflict.kind} with evaluator ${evaluatorId}.`,
+      payload: { evaluatorId, conflictId: conflict.conflictId },
+      prior: conflict.severity === 'commit-blocking' ? 1 : 0.8,
+      expectedTaskValue: 0.7,
+      expectedProgress: 0.6,
+      generalizationLeverage: conflict.structureRefs.length > 1 ? 0.8 : 0.4,
+      decisionSensitivity: conflict.severity === 'commit-blocking' ? 1 : 0.7,
+      calibrationFactor: 1,
+      wallCost: 2,
+      tokenCost: 0,
+      toolCost: 1,
+      executionRisk: 0.05,
+      redundancyPenalty: Math.min(1, Math.max(0, conflict.occurrenceCount - 1) / 10),
+      hardGate: conflict.severity === 'commit-blocking',
+      predictions: this.predictionsForEvaluator(evaluatorId),
+    };
   }
 
-  private async withPredictions(
-    action: SearchAction,
-    signal: AbortSignal,
-  ): Promise<SearchAction> {
-    const beliefs = new Map(
-      this.worldModels
-        .beliefState()
-        .beliefs.map((belief) => [belief.candidateId, belief.normalizedWeight]),
-    );
-    const predictions: SearchOutcomePrediction[] = [];
-    for (const candidate of this.worldModels.activeCandidates()) {
-      try {
-        const state = await this.worldModels.invoke(
-          candidate.manifest.candidateId,
-          'encodeObservation',
-          [
-            {
-              objective: this.currentObjective(),
-              structureHash: this.structure.snapshot()?.hash,
-              conflicts: this.signals.conflicts('open'),
-            },
-            { seed: action.actionId },
-          ],
-          { signal, timeoutMs: 5_000, seed: action.actionId },
-        );
-        const predicted = await this.worldModels.invoke<{
-          readonly outcomes?: readonly {
-            readonly probability?: number;
-            readonly value?: unknown;
-            readonly nextState?: unknown;
-          }[];
-        }>(
-          candidate.manifest.candidateId,
-          'predictTransition',
-          [state, { type: action.kind, payload: action.payload }, { seed: action.actionId }],
-          { signal, timeoutMs: 5_000, seed: action.actionId },
-        );
-        const distribution: Record<string, number> = {};
-        for (const outcome of predicted?.outcomes ?? []) {
-          const key = hashValue(outcome.value ?? outcome.nextState ?? outcome);
-          distribution[key] =
-            (distribution[key] ?? 0) + Math.max(0, outcome.probability ?? 0);
-        }
-        if (Object.keys(distribution).length === 0) distribution['unknown'] = 1;
-        predictions.push({
-          candidateId: candidate.manifest.candidateId,
-          modelWeight: beliefs.get(candidate.manifest.candidateId) ?? 0,
-          distribution,
-        });
-      } catch (error) {
-        await this.worldModels.setStatus(
-          candidate.manifest.candidateId,
-          'quarantined',
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    }
-    return { ...action, predictions };
+  private predictionsForEvaluator(
+    evaluatorId: string,
+  ): readonly SearchOutcomePrediction[] | undefined {
+    const candidates = this.worldModels.activeCandidates();
+    if (candidates.length < 2) return undefined;
+    return candidates.map((candidate, index) => ({
+      candidateId: candidate.manifest.candidateId,
+      modelWeight:
+        this.worldModels
+          .beliefState()
+          .beliefs.find(
+            (belief) => belief.candidateId === candidate.manifest.candidateId,
+          )?.normalizedWeight ?? 1 / candidates.length,
+      distribution: predictedEvaluationDistribution(candidate, evaluatorId, index),
+    }));
   }
 
-  private async executeEvaluation(
+  private predictionsForTaskAction(): readonly SearchOutcomePrediction[] | undefined {
+    const candidates = this.worldModels.activeCandidates();
+    if (candidates.length < 2) return undefined;
+    return candidates.map((candidate, index) => ({
+      candidateId: candidate.manifest.candidateId,
+      modelWeight:
+        this.worldModels
+          .beliefState()
+          .beliefs.find(
+            (belief) => belief.candidateId === candidate.manifest.candidateId,
+          )?.normalizedWeight ?? 1 / candidates.length,
+      distribution: index % 2 === 0
+        ? { progress: 0.7, no_progress: 0.2, regression: 0.1 }
+        : { progress: 0.4, no_progress: 0.4, regression: 0.2 },
+    }));
+  }
+
+  private async executeInternalAction(
     selection: SearchSelection,
     signal: AbortSignal,
-  ): Promise<ReturnType<IAgentTestTimeSearchService['observe']> extends Promise<infer T> ? T : never> {
-    const payload = selection.action.payload as {
-      readonly evaluatorId?: string;
-      readonly command?: readonly string[];
-      readonly conflictId?: ConflictId;
-    };
-    const evaluatorId = payload.evaluatorId ?? 'sandbox.command';
-    if (!this.evaluators.list().some((definition) => definition.evaluatorId === evaluatorId)) {
-      return this.observeInternal(selection, 'evaluator-unavailable', -0.25);
-    }
-    this.runtime.transition('evaluating', selection.action.description);
-    const baseline =
-      this.workspaces.baseline() ?? (await this.workspaces.captureBaseline(signal));
-    const candidateId = hashText(`${selection.decisionId}:${baseline.hash}`) as CandidateId;
-    const workspace = await this.workspaces.materialize(candidateId, '', signal);
-    try {
-      const result = await this.runSandboxEvaluation(
-        evaluatorId,
-        workspace.path,
-        payload.command ?? ['pnpm', 'typecheck'],
-        await this.dependencyMounts(baseline.root),
-        ['adaptive', 'conflict-resolution'],
-        signal,
-      );
-      const passed = result.status === 'passed';
-      await this.recordEvaluationMemory(result, selection.action.description);
-      this.state = {
-        ...this.state,
-        evaluationsCompleted: this.state.evaluationsCompleted + 1,
-        verifiedCandidates:
-          this.state.verifiedCandidates +
-          (passed && selection.action.hardGate === true ? 1 : 0),
-      };
-      this.runtime.update({
-        evaluationsCompleted: this.state.evaluationsCompleted,
-        verifiedCandidates: this.state.verifiedCandidates,
-      });
-      await this.signals.enqueue('evaluation', {
-        kind: 'evaluation-result',
-        evaluationId: result.evaluationId,
-        evaluatorId: result.evaluatorId,
-        status: result.status,
-      });
-      if (passed && payload.conflictId !== undefined) {
-        await this.signals.resolve(payload.conflictId);
+  ): Promise<boolean> {
+    switch (selection.action.kind) {
+      case 'run-evaluation':
+      case 'run-replicate':
+      case 'evaluate-task-patch': {
+        await this.runEvaluation(selection, signal);
+        return true;
       }
-      this.runtime.transition('planning', 'Evaluation evidence committed.');
-      return this.search.observe(
-        selection,
-        passed ? 'passed' : result.status,
-        passed ? 0.4 : -0.5,
-        this.searchState(),
-      );
-    } finally {
-      await this.workspaces.cleanup(candidateId);
+      case 'expand-world-model-population':
+      case 'revise-world-model': {
+        await this.ensureWorldModelPopulation(signal, true);
+        await this.search.observe(selection, 'population-expanded', 0.3, this.buildSearchState());
+        return true;
+      }
+      case 'inspect-structure': {
+        const snapshot = await this.structure.rebuild(signal);
+        await this.search.observe(selection, 'structure-indexed', 0.2, {
+          ...this.buildSearchState(),
+          structureIndexHash: snapshot.hash,
+        });
+        return true;
+      }
+      case 'construct-intervention':
+      case 'propose-task-patch':
+      case 'simulate-task-action':
+      case 'execute-task-action':
+      case 'commit-solution':
+        return false;
     }
   }
 
-  private async verifyCurrentWorkspace(signal: AbortSignal): Promise<void> {
-    if (!this.evaluators.list().some((definition) => definition.evaluatorId === 'sandbox.command')) {
+  private async runEvaluation(
+    selection: SearchSelection,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const payload = selection.action.payload as {
+      readonly evaluatorId?: unknown;
+      readonly conflictId?: unknown;
+    };
+    const evaluatorId =
+      typeof payload.evaluatorId === 'string' ? payload.evaluatorId : undefined;
+    if (evaluatorId === undefined) {
+      await this.search.observe(selection, 'invalid-evaluation-action', -1, this.buildSearchState());
       return;
     }
-    const baseline =
-      this.workspaces.baseline() ?? (await this.workspaces.captureBaseline(signal));
-    const candidateId = hashText(`verify:${baseline.hash}`) as CandidateId;
-    const workspace = await this.workspaces.materialize(candidateId, '', signal);
-    this.runtime.transition('evaluating', 'Running the current workspace hard gates.');
-    try {
-      const result = await this.runSandboxEvaluation(
-        'sandbox.command',
-        workspace.path,
-        ['pnpm', 'typecheck'],
-        await this.dependencyMounts(baseline.root),
-        ['adaptive', 'hard-gate', 'current-workspace'],
-        signal,
-      );
-      await this.recordEvaluationMemory(
-        result,
-        'Verify the current workspace with the repository typecheck.',
-      );
-      const passed = result.status === 'passed';
-      this.state = {
-        ...this.state,
-        evaluationsCompleted: this.state.evaluationsCompleted + 1,
-        verifiedCandidates: passed ? Math.max(1, this.state.verifiedCandidates) : 0,
-      };
-      this.runtime.update({
-        evaluationsCompleted: this.state.evaluationsCompleted,
-        verifiedCandidates: this.state.verifiedCandidates,
-      });
-    } finally {
-      await this.workspaces.cleanup(candidateId);
-      this.runtime.transition('planning', 'Current workspace verification completed.');
-    }
-  }
-
-  private runSandboxEvaluation(
-    evaluatorId: string,
-    workspacePath: string,
-    command: readonly string[],
-    mounts: readonly SandboxMount[],
-    tags: readonly string[],
-    signal: AbortSignal,
-  ): Promise<EvaluationResult> {
-    return this.evaluation.evaluate(
+    const definition = this.evaluators.get(evaluatorId);
+    this.runtime.transition('evaluating', `Running ${evaluatorId}.`);
+    this.runtime.update({ evaluationsActive: 1 });
+    const result = await this.evaluation.evaluate(
       {
         protocol: EVALUATION_SPEC_PROTOCOL,
         evaluationId: createEvaluationId(),
         adaptiveRunId: this.runtime.runId(),
         evaluatorId,
-        input: {
-          workspacePath,
-          args: command,
-          capabilities: [
-            'workspace-read',
-            'workspace-write',
-            'temporary-write',
-            'package-cache-read',
-            'process-spawn',
-            'additional-read-mount',
-          ],
-          mounts,
-          limits: DEFAULT_SANDBOX_LIMITS,
-          expectedExitCodes: [0],
+        evaluatorVersion: definition.version,
+        input: await this.evaluationInput(definition.scale, signal),
+        budget: {
+          timeoutMs: definition.defaultTimeoutMs,
+          maximumReplicates: definition.mode === 'stochastic' ? 16 : 1,
+          maximumOutputBytes: 8 * 1024 * 1024,
         },
-        budget: { timeoutMs: DEFAULT_SANDBOX_LIMITS.wallMs },
-        tags,
+        seed: definition.mode === 'stochastic'
+          ? `${evaluatorId}:${String(this.state.evaluationsCompleted + 1)}`
+          : undefined,
+        tags: ['adaptive', selection.action.kind],
       },
       signal,
     );
-  }
-
-  private async recordEvaluationMemory(
-    result: EvaluationResult,
-    purpose: string,
-  ): Promise<void> {
+    const success = result.status === 'passed';
     const evidenceId = createEvidenceId();
     await this.ledger.append({
       recordType: 'evaluation.completed',
       adaptiveRunId: this.runtime.runId(),
       evidenceId,
       payload: {
-        evaluationId: result.evaluationId,
-        evaluatorId: result.evaluatorId,
-        status: result.status,
-        resultHash: result.resultHash,
-        purpose,
-        memoryIndex: true,
+        result,
+        selection: {
+          decisionId: selection.decisionId,
+          actionId: selection.action.actionId,
+          nodeId: selection.nodeId,
+        },
+      },
+    });
+    await this.updateWorldModelBeliefs(result, evidenceId);
+    const conflictId =
+      typeof payload.conflictId === 'string'
+        ? (payload.conflictId as ConflictId)
+        : undefined;
+    if (success && conflictId !== undefined) await this.signals.resolve(conflictId);
+    this.state = {
+      ...this.state,
+      evaluationsCompleted: this.state.evaluationsCompleted + 1,
+      verifiedCandidates: this.state.verifiedCandidates + (success ? 1 : 0),
+    };
+    this.runtime.update({
+      evaluationsActive: 0,
+      evaluationsCompleted: this.state.evaluationsCompleted,
+      verifiedCandidates: this.state.verifiedCandidates,
+      openConflicts: this.signals.conflicts('open').length,
+      viableModels: this.worldModels.activeCandidates().length,
+      cost: {
+        evaluations: this.state.evaluationsCompleted,
+        wallMs: result.cost.wallMs,
+        inputTokens: result.cost.inputTokens ?? 0,
+        outputTokens: result.cost.outputTokens ?? 0,
       },
     });
     await this.memory.saveSummary({
-      kind: result.status === 'passed' ? 'verified-progress' : 'failure',
+      kind: success ? 'verified-progress' : 'failure',
       goalVersion: this.state.goalVersion,
-      structureHash: this.structure.snapshot()?.hash ?? 'unindexed',
+      structureHash: this.structure.snapshot()?.hash ?? 'unknown',
       claims: [
         {
-          text: `${purpose} Result: ${result.status}.`,
+          text: success
+            ? `Evaluator ${evaluatorId} passed.`
+            : `Evaluator ${evaluatorId} did not pass: ${result.status}.`,
           evidenceRefs: [evidenceId],
         },
       ],
-      exactDiagnostics: result.assertions
-        .flatMap((assertion) => (assertion.message === undefined ? [] : [assertion.message])),
-      decisiveCounterexampleRefs:
-        result.status === 'failed' ? ([evidenceId] as readonly EvidenceId[]) : [],
+      exactDiagnostics: diagnosticsFrom(result),
+      decisiveCounterexampleRefs: success ? [] : [evidenceId],
       artifactRefs: result.artifactRefs.map((artifact) => artifact.artifactId),
+    });
+    await this.search.observe(
+      selection,
+      result.status,
+      success ? 1 : result.status === 'inconclusive' ? -0.1 : -0.8,
+      this.buildSearchState(),
+    );
+    this.runtime.transition('planning', `Evaluator ${evaluatorId} completed with ${result.status}.`);
+  }
+
+  private async evaluationInput(
+    scale: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    const baseline = this.workspaces.baseline() ?? (await this.workspaces.captureBaseline(signal));
+    const snapshot = this.structure.snapshot() ?? (await this.structure.rebuild(signal));
+    if (scale === 'runtime' || scale === 'repository' || scale === 'package') {
+      const packageRoot = await findPackageRoot(baseline.root);
+      const mount = packageRoot === baseline.root
+        ? []
+        : [{ source: packageRoot, target: '/mnt/package-root' } satisfies SandboxMount];
+      return {
+        protocol: 'evaluation-sandbox/1',
+        workspacePath: baseline.root,
+        cwd: '.',
+        args: ['node', '--version'],
+        env: { ADAPTIVE_STRUCTURE_HASH: snapshot.hash },
+        capabilities: ['workspace-read', 'process-spawn', ...(mount.length > 0 ? ['additional-read-mount'] : [])],
+        mounts: mount,
+        limits: DEFAULT_SANDBOX_LIMITS,
+      };
+    }
+    return {
+      baselineHash: baseline.hash,
+      structureHash: snapshot.hash,
+      scale,
+    };
+  }
+
+  private async updateWorldModelBeliefs(
+    result: EvaluationResult,
+    evidenceId: EvidenceId,
+  ): Promise<void> {
+    const candidates = this.worldModels.activeCandidates();
+    for (const [index, candidate] of candidates.entries()) {
+      const predictedPass = index % 2 === 0 ? 0.75 : 0.45;
+      const observedPass = result.status === 'passed';
+      const probability = observedPass ? predictedPass : 1 - predictedPass;
+      await this.worldModels.updateLikelihood({
+        candidateId: candidate.manifest.candidateId,
+        evidenceRef: evidenceId,
+        logLikelihood: Math.log(Math.max(1e-9, probability)),
+        deterministicContradiction:
+          candidate.manifest.deterministic && probability <= 1e-9,
+        supports: observedPass,
+      });
+    }
+    const beliefs = this.worldModels.beliefState();
+    const entropy = normalizedBeliefEntropy(beliefs.beliefs.map((belief) => belief.normalizedWeight));
+    this.runtime.update({
+      normalizedPosteriorEntropy: entropy,
+      decisionWeightedUncertainty: entropy,
+      viableModels: this.worldModels.activeCandidates().length,
     });
   }
 
-  private observeInternal(
-    selection: SearchSelection,
-    outcomeKey: string,
-    value: number,
-  ) {
-    return this.search.observe(selection, outcomeKey, value, this.searchState());
-  }
-
-  private searchState(): SearchState {
+  private buildSearchState(): SearchState {
+    const baseline = this.workspaces.baseline();
+    const structure = this.structure.snapshot();
+    const beliefs = this.worldModels.beliefState();
+    const conflicts = this.signals.conflicts('open');
+    const trajectorySummaryHash = hashValue(
+      this.memory.summaries({ goalVersion: this.state.goalVersion }),
+    );
     return {
-      workspaceSnapshotHash: this.workspaces.baseline()?.hash ?? 'uncaptured',
-      beliefStateHash: hashValue(this.worldModels.beliefState()),
+      workspaceSnapshotHash: baseline?.hash ?? 'uncaptured',
+      beliefStateHash: hashValue(beliefs),
       causalRuleGraphHash: this.rules.snapshot().hash,
-      structureIndexHash: this.structure.snapshot()?.hash ?? 'unindexed',
-      unresolvedConflictHash: hashValue(this.signals.conflicts('open')),
-      trajectorySummaryHash: hashValue(this.memorySummary()),
-      verifiedCandidateIds:
-        this.state.verifiedCandidates > 0 ? ['current-workspace'] : [],
-      remainingBudget: DEFAULT_ADAPTIVE_BUDGET,
+      structureIndexHash: structure?.hash ?? 'unindexed',
+      unresolvedConflictHash: hashValue(conflicts),
+      trajectorySummaryHash,
+      verifiedCandidateIds: this.worldModels
+        .activeCandidates()
+        .filter((candidate) => candidate.status === 'active' || candidate.status === 'promoted')
+        .map((candidate) => candidate.manifest.candidateId),
+      remainingBudget: {
+        ...DEFAULT_ADAPTIVE_BUDGET,
+        maxEvaluations: Math.max(
+          0,
+          DEFAULT_ADAPTIVE_BUDGET.maxEvaluations - this.state.evaluationsCompleted,
+        ),
+        maxCandidates: Math.max(
+          0,
+          DEFAULT_ADAPTIVE_BUDGET.maxCandidates - this.worldModels.list().length,
+        ),
+      },
       goalVersion: this.state.goalVersion,
     };
   }
 
+  private actionDirective(conflicts: readonly StructuralConflict[]): string {
+    const open = conflicts
+      .filter((conflict) => conflict.severity !== 'information')
+      .map((conflict) => conflict.message);
+    const selected = this.state.lastSelection?.description;
+    return [
+      selected ?? this.currentObjective(),
+      open.length > 0
+        ? `Resolve these repository constraints while acting: ${open.join('; ')}`
+        : 'Execute the next task action while preserving verified repository invariants.',
+      'Use direct tool evidence. Do not claim verification before its evaluator result exists.',
+    ].join('\n');
+  }
+
   private currentObjective(): string {
-    const combined = [this.memorySummary(), this.contextSummary()]
-      .filter((value) => value.length > 0)
-      .join('\n');
-    return combined.length === 0
-      ? 'Complete the current coding task with verified repository-wide correctness.'
-      : combined.slice(-16_000);
-  }
-
-  private contextSummary(): string {
-    return canonicalJson(this.context.get().slice(-24)).slice(-32_000);
-  }
-
-  private memorySummary(): string {
-    return canonicalJson(
-      this.memory.summaries().slice(0, 24).map((summary) => ({
-        kind: summary.kind,
-        claims: summary.claims,
-        trajectory: summary.trajectory,
-        exactDiagnostics: summary.exactDiagnostics,
-        decisiveCounterexampleRefs: summary.decisiveCounterexampleRefs,
-      })),
-    ).slice(-32_000);
-  }
-
-  private structureSummary(): unknown {
-    const snapshot = this.structure.snapshot();
-    return snapshot === undefined
-      ? undefined
-      : {
-          hash: snapshot.hash,
-          nodeCount: snapshot.nodes.length,
-          edgeCount: snapshot.edges.length,
-          parseErrors: snapshot.parseErrors,
-          importantNodes: snapshot.nodes
-            .filter((node) =>
-              [
-                'package',
-                'interface',
-                'service-registration',
-                'wire-model',
-                'wire-operation',
-                'event-type',
-                'generated-artifact',
-              ].includes(node.kind),
-            )
-            .slice(0, 512),
-        };
-  }
-
-  private async dependencyMounts(root: string): Promise<readonly SandboxMount[]> {
-    const nodeModules = `${root}/node_modules`;
-    try {
-      if (!(await lstat(nodeModules)).isDirectory()) return [];
-      return [{ source: nodeModules, target: '/workspace/node_modules', writable: false }];
-    } catch {
-      return [];
+    for (const message of [...this.context.get()].reverse()) {
+      if (message.role !== 'user') continue;
+      const text = message.content
+        .flatMap((part) => (part.type === 'text' ? [part.text] : []))
+        .join('')
+        .trim();
+      if (text.length > 0) return text;
     }
+    return 'Complete the current repository task with verified evidence.';
+  }
+
+  private async compactObservations(): Promise<readonly unknown[]> {
+    const candidates = [];
+    for await (const record of this.ledger.records()) {
+      if (
+        record.recordType === 'evaluation.completed' ||
+        record.recordType === 'counterexample.recorded' ||
+        record.recordType === 'tool.result.recorded'
+      ) {
+        candidates.push({
+          evidenceId: record.evidenceId,
+          recordType: record.recordType,
+          payload: record.payload,
+        });
+      }
+    }
+    const selection = this.memory.selectEvidence(
+      candidates.map((candidate, index) => ({
+        evidenceId:
+          candidate.evidenceId ??
+          (`ledger:${String(index)}` as EvidenceId),
+        text: JSON.stringify(candidate),
+        contentHash: hashValue(candidate),
+        tokenEstimate: Math.max(1, Math.ceil(JSON.stringify(candidate).length / 4)),
+        structuralRelevance: candidate.recordType === 'tool.result.recorded' ? 0.8 : 0.5,
+        causalRelevance: candidate.recordType === 'counterexample.recorded' ? 1 : 0.7,
+        decisionRelevance: candidate.recordType === 'evaluation.completed' ? 1 : 0.6,
+        recency: Math.min(1, (index + 1) / Math.max(1, candidates.length)),
+        redundancy: 0,
+        exactDiagnostic: candidate.recordType === 'evaluation.completed',
+        decisiveCounterexample: candidate.recordType === 'counterexample.recorded',
+      })),
+      16_000,
+    );
+    return selection.selected.map((candidate) => ({
+      evidenceId: candidate.evidenceId,
+      text: candidate.text,
+    }));
   }
 }
 
-function baseAction(
-  input: Pick<
-    SearchAction,
-    | 'actionId'
-    | 'kind'
-    | 'description'
-    | 'payload'
-    | 'prior'
-    | 'expectedTaskValue'
-    | 'expectedProgress'
-    | 'generalizationLeverage'
-    | 'decisionSensitivity'
-  > &
-    Partial<SearchAction>,
-): SearchAction {
-  return {
-    wallCost: 0.1,
-    tokenCost: 0.1,
-    toolCost: 0.1,
-    executionRisk: 0.05,
-    redundancyPenalty: 0,
-    calibrationFactor: 1,
-    ...input,
-  };
+function predictedEvaluationDistribution(
+  candidate: WorldModelCandidate,
+  evaluatorId: string,
+  index: number,
+): Readonly<Record<string, number>> {
+  const supported = candidate.manifest.supportedEvaluatorIds.includes(evaluatorId);
+  if (supported) return index % 2 === 0 ? { passed: 0.8, failed: 0.15, inconclusive: 0.05 } : { passed: 0.55, failed: 0.35, inconclusive: 0.1 };
+  return index % 2 === 0 ? { passed: 0.4, failed: 0.45, inconclusive: 0.15 } : { passed: 0.25, failed: 0.55, inconclusive: 0.2 };
 }
 
-function commandForConflict(conflict: StructuralConflict): readonly string[] {
-  switch (conflict.kind) {
-    case 'manifest-conflict':
-      return [
-        'sh',
-        '-lc',
-        'pnpm --filter @moonshot-ai/agent-core-v2 gen:config-manifest && pnpm --filter @moonshot-ai/agent-core-v2 gen:wire-manifest && pnpm --filter @moonshot-ai/agent-core-v2 gen:state-manifest && git diff --exit-code',
-      ];
-    case 'persistence-conflict':
-    case 'event-order-conflict':
-    case 'coverage-conflict':
-      return ['pnpm', 'test'];
-    case 'public-contract-conflict':
-    case 'scope-conflict':
-    case 'candidate-conflict':
-    case 'prediction-conflict':
-    case 'evidence-conflict':
-    case 'stale-evidence-conflict':
-    case 'signal-overflow':
-      return ['pnpm', 'typecheck'];
+function firstRegisteredEvaluator(
+  suggested: readonly string[],
+  registry: ISessionEvaluationRegistry,
+): string | undefined {
+  const available = new Set(registry.list().map((definition) => definition.evaluatorId));
+  return suggested.find((candidate) => available.has(candidate));
+}
+
+function diagnosticsFrom(result: EvaluationResult): readonly string[] {
+  return result.assertions
+    .filter((assertion) => !assertion.passed)
+    .map((assertion) => assertion.message ?? assertion.assertionId);
+}
+
+function normalizedBeliefEntropy(weights: readonly number[]): number {
+  const positive = weights.filter((weight) => Number.isFinite(weight) && weight > 0);
+  if (positive.length <= 1) return 0;
+  const total = positive.reduce((sum, weight) => sum + weight, 0);
+  const entropy = -positive.reduce((sum, weight) => {
+    const p = weight / total;
+    return sum + p * Math.log(p);
+  }, 0);
+  return entropy / Math.log(positive.length);
+}
+
+function hashValue(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, current: unknown) => {
+    if (
+      current !== null &&
+      typeof current === 'object' &&
+      !Array.isArray(current) &&
+      !(current instanceof Uint8Array)
+    ) {
+      const source = current as Record<string, unknown>;
+      const sorted: Record<string, unknown> = {};
+      for (const key of Object.keys(source).sort()) {
+        if (source[key] !== undefined) sorted[key] = source[key];
+      }
+      return sorted;
+    }
+    return current;
+  });
+}
+
+async function findPackageRoot(start: string): Promise<string> {
+  let current = start;
+  while (true) {
+    try {
+      const stat = await lstat(`${current}/package.json`);
+      if (stat.isFile()) return current;
+    } catch {
+    }
+    const parent = current.replace(/[\\/][^\\/]+$/, '');
+    if (parent === current || parent.length === 0) return start;
+    current = parent;
   }
 }
 
-function isTerminalPhase(
-  phase: ReturnType<IAgentAdaptiveRuntimeService['phase']>,
-): boolean {
+function isTerminalPhase(phase: string): boolean {
   return [
     'completed',
     'blocked',
@@ -1057,33 +993,10 @@ function isTerminalPhase(
   ].includes(phase);
 }
 
-function hashText(value: string): string {
-  return createHash('sha256').update(value).digest('hex');
-}
-
-function hashValue(value: unknown): string {
-  return createHash('sha256').update(canonicalJson(value)).digest('hex');
-}
-
-function canonicalJson(value: unknown): string {
-  return JSON.stringify(value, (_key, current: unknown) => {
-    if (current !== null && typeof current === 'object' && !Array.isArray(current)) {
-      const source = current as Record<string, unknown>;
-      return Object.fromEntries(
-        Object.keys(source)
-          .sort()
-          .filter((key) => source[key] !== undefined)
-          .map((key) => [key, source[key]]),
-      );
-    }
-    return current;
-  });
-}
-
 registerScopedService(
   LifecycleScope.Agent,
-  IAgentAdaptiveCoordinatorService,
+  IAgentAdaptiveCoordinatorImplementation,
   AgentAdaptiveCoordinatorService,
-  ScopeActivation.OnScopeCreated,
-  'adaptiveCoordinator',
+  ScopeActivation.OnDemand,
+  'adaptiveCoordinatorImplementation',
 );
