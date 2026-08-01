@@ -12,6 +12,7 @@ export type EvaluationLedgerRecordType =
   | 'evaluation.replicate.completed'
   | 'evaluation.completed'
   | 'counterexample.recorded'
+  | 'evidence.link.recorded'
   | 'structural.signal.recorded'
   | 'conflict.opened'
   | 'conflict.resolved'
