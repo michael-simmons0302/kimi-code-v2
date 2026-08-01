@@ -65,10 +65,17 @@ export interface HostArgsInput {
 }
 
 export function resolveHostArgs(input: HostArgsInput | undefined): HostArgs {
-  return {
-    agentFiles: input?.agentFiles,
-    skillDirs: input?.skillDirs,
-    requestHeaders: input?.requestHeaders ?? {},
+  const agentFiles = input?.agentFiles === undefined
+    ? undefined
+    : Object.freeze([...input.agentFiles]);
+  const skillDirs = input?.skillDirs === undefined
+    ? undefined
+    : Object.freeze([...input.skillDirs]);
+  const requestHeaders = Object.freeze({ ...(input?.requestHeaders ?? {}) });
+  return Object.freeze({
+    agentFiles,
+    skillDirs,
+    requestHeaders,
     displayName: input?.displayName,
     replyStyleGuide: input?.replyStyleGuide,
     adaptiveMode:
@@ -76,7 +83,7 @@ export function resolveHostArgs(input: HostArgsInput | undefined): HostArgs {
       currentAdaptiveHostModeOverride() ??
       processAdaptiveHostMode() ??
       'disabled',
-  };
+  });
 }
 
 export interface IBootstrapOptions {
@@ -145,7 +152,7 @@ export function resolveBootstrapOptions(input: BootstrapInput): IBootstrapOption
   const osHomeDir = input.osHomeDir ?? homedir();
   const homeDir = resolveKimiHome(input.homeDir, env, osHomeDir);
   const configPath = input.configPath ?? join(homeDir, 'config.toml');
-  return {
+  return Object.freeze({
     homeDir,
     configPath,
     osHomeDir,
@@ -155,7 +162,7 @@ export function resolveBootstrapOptions(input: BootstrapInput): IBootstrapOption
     env,
     clientIdentity: input.clientIdentity,
     args: resolveHostArgs(input.args),
-  };
+  });
 }
 
 export function bootstrapSeed(input: BootstrapInput): ScopeSeed {
