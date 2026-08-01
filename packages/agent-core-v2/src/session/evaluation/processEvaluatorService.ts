@@ -1,3 +1,4 @@
+import { createDecorator } from '#/_base/di/instantiation';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ISessionProcessRunner } from '#/session/process/processRunner';
@@ -21,7 +22,20 @@ export interface ProcessEvaluationOutcome {
   readonly stderrTruncated: boolean;
 }
 
-export class SessionProcessEvaluatorService extends Disposable {
+export interface ISessionProcessEvaluatorService {
+  readonly _serviceBrand: undefined;
+}
+
+export const ISessionProcessEvaluatorService = createDecorator<ISessionProcessEvaluatorService>(
+  'sessionProcessEvaluatorService',
+);
+
+export class SessionProcessEvaluatorService
+  extends Disposable
+  implements ISessionProcessEvaluatorService
+{
+  declare readonly _serviceBrand: undefined;
+
   constructor(
     @ISessionEvaluationRegistry registry: ISessionEvaluationRegistry,
     @ISessionProcessRunner processRunner: ISessionProcessRunner,
@@ -145,7 +159,7 @@ function normalizeMaximumBytes(value: number | undefined): number {
 
 registerScopedService(
   LifecycleScope.Session,
-  SessionProcessEvaluatorService,
+  ISessionProcessEvaluatorService,
   SessionProcessEvaluatorService,
   ScopeActivation.OnScopeCreated,
   'processEvaluator',
