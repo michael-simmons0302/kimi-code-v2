@@ -1,7 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import type { Readable } from 'node:stream';
 
-import type { ProcessEvidenceRecorder } from '#/agent/evaluationEvidence/processEvidenceRecorderService';
+import type { ProcessEvidenceRecorder } from '#/agent/evaluationEvidence/processEvidenceRecorder';
 import type { IProcess } from '#/session/process/processRunner';
 import type { ToolEvidenceEnvelope } from '#/tool/toolContract';
 
@@ -46,6 +46,7 @@ export class ProcessTask implements AgentTask {
     readonly description: string,
     private readonly onOutput?: ProcessTaskOutputCallback,
     private readonly evidenceRecorder?: ProcessEvidenceRecorder,
+    private readonly modelOutputBytes?: () => number,
   ) {}
 
   evidence(): ToolEvidenceEnvelope | undefined {
@@ -108,6 +109,7 @@ export class ProcessTask implements AgentTask {
         timedOut,
         cancelled: sink.signal.aborted && !timedOut,
         terminationSignal: sink.signal.aborted ? 'SIGTERM' : undefined,
+        modelOutputBytes: Math.max(0, this.modelOutputBytes?.() ?? 0),
       });
     } catch (error) {
       settlement = {
