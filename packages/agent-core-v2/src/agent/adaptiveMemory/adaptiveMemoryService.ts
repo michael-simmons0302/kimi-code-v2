@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
+import type { EvidenceId } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
@@ -10,7 +11,10 @@ import {
   IAgentAdaptiveMemoryService,
   type AdaptiveEvidenceCandidate,
   type AdaptiveEvidenceSelection,
+  type AdaptiveSummaryClaim,
+  type AdaptiveSummaryKind,
   type AdaptiveSummaryRecord,
+  type AdaptiveTrajectorySummary,
   type SaveAdaptiveSummaryInput,
 } from './adaptiveMemory';
 
@@ -19,6 +23,17 @@ const STORE_KEY = 'adaptive-memory.json';
 interface PersistedAdaptiveMemory {
   readonly protocol: typeof ADAPTIVE_MEMORY_PROTOCOL;
   readonly summaries: readonly AdaptiveSummaryRecord[];
+}
+
+interface NormalizedSummaryInput {
+  readonly kind: AdaptiveSummaryKind;
+  readonly goalVersion: number;
+  readonly structureHash: string;
+  readonly claims: readonly AdaptiveSummaryClaim[];
+  readonly trajectory?: AdaptiveTrajectorySummary;
+  readonly exactDiagnostics: readonly string[];
+  readonly decisiveCounterexampleRefs: readonly EvidenceId[];
+  readonly artifactRefs: readonly string[];
 }
 
 export class AgentAdaptiveMemoryService
@@ -85,7 +100,7 @@ export class AgentAdaptiveMemoryService
 
   summaries(options: {
     readonly includeStale?: boolean;
-    readonly kind?: AdaptiveSummaryRecord['kind'];
+    readonly kind?: AdaptiveSummaryKind;
   } = {}): readonly AdaptiveSummaryRecord[] {
     return this.records
       .filter((record) => options.includeStale === true || !record.stale)
@@ -102,7 +117,8 @@ export class AgentAdaptiveMemoryService
     }
     const unique = deduplicateCandidates(candidates);
     const mandatory = unique.filter(
-      (candidate) => candidate.exactDiagnostic === true || candidate.decisiveCounterexample === true,
+      (candidate) =>
+        candidate.exactDiagnostic === true || candidate.decisiveCounterexample === true,
     );
     const mandatoryTokens = mandatory.reduce(
       (total, candidate) => total + normalizedTokenEstimate(candidate),
@@ -227,7 +243,9 @@ function validateSummaryInput(
     throw new Error('Adaptive summaries require at least one evidence-backed claim.');
   }
   for (const claim of input.claims) {
-    if (claim.text.trim().length === 0) throw new Error('Adaptive summary claims cannot be empty.');
+    if (claim.text.trim().length === 0) {
+      throw new Error('Adaptive summary claims cannot be empty.');
+    }
     if (claim.evidenceRefs.length === 0) {
       throw new Error(`Adaptive summary claim is unsupported: ${claim.text}`);
     }
@@ -250,13 +268,11 @@ function assertKnownEvidence(
   }
 }
 
-function normalizeSummaryInput(input: SaveAdaptiveSummaryInput): SaveAdaptiveSummaryInput & {
-  readonly exactDiagnostics: readonly string[];
-  readonly decisiveCounterexampleRefs: readonly SaveAdaptiveSummaryInput['decisiveCounterexampleRefs'] & readonly [] | readonly any[];
-  readonly artifactRefs: readonly string[];
-} {
+function normalizeSummaryInput(input: SaveAdaptiveSummaryInput): NormalizedSummaryInput {
   return {
-    ...input,
+    kind: input.kind,
+    goalVersion: input.goalVersion,
+    structureHash: input.structureHash,
     claims: dedupeBy(
       input.claims.map((claim) => ({
         text: dedupeLines(claim.text),
