@@ -1,3 +1,4 @@
+import { createDecorator } from '#/_base/di/instantiation';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { abortError } from '#/_base/utils/abort';
@@ -12,6 +13,13 @@ import { IAgentAdaptiveRuntimeService } from './adaptiveRuntime';
 const PREPARE_PRIORITY = -1_000_000;
 const RECONCILE_PRIORITY = 1_000_000;
 
+export interface IAgentAdaptiveLoopBridgeService {
+  readonly _serviceBrand: undefined;
+}
+
+export const IAgentAdaptiveLoopBridgeService =
+  createDecorator<IAgentAdaptiveLoopBridgeService>('agentAdaptiveLoopBridgeService');
+
 /**
  * Ordered bridge used until the loop owns the coordinator calls directly.
  *
@@ -19,7 +27,12 @@ const RECONCILE_PRIORITY = 1_000_000;
  * ordinary post-step hooks. Coordinator failures are converted to abort errors
  * because the legacy post-step runner only propagates abort-class failures.
  */
-export class AgentAdaptiveLoopBridgeService extends Disposable {
+export class AgentAdaptiveLoopBridgeService
+  extends Disposable
+  implements IAgentAdaptiveLoopBridgeService
+{
+  declare readonly _serviceBrand: undefined;
+
   constructor(
     @IAgentLoopService loop: IAgentLoopService,
     @IAgentAdaptiveCoordinatorService coordinator: IAgentAdaptiveCoordinatorService,
@@ -101,7 +114,7 @@ function failClosedAbort(error: unknown): Error {
 
 registerScopedService(
   LifecycleScope.Agent,
-  AgentAdaptiveLoopBridgeService,
+  IAgentAdaptiveLoopBridgeService,
   AgentAdaptiveLoopBridgeService,
   ScopeActivation.OnScopeCreated,
   'adaptiveLoopBridge',
