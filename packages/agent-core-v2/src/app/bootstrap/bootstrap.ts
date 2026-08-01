@@ -34,6 +34,8 @@ import { FileStorageService } from '#/persistence/backends/node-fs/fileStorageSe
 import { FileSkillDiscovery } from '#/app/skillCatalog/fileSkillDiscovery';
 import { ISkillDiscovery } from '#/app/skillCatalog/skillDiscovery';
 
+export type AdaptiveHostMode = 'disabled' | 'enabled';
+
 /**
  * Host invocation arguments — process-level overrides the embedding host
  * states once at startup (mirrors VS Code's `NativeParsedArgs` carried on the
@@ -63,15 +65,21 @@ export interface HostArgs {
   readonly displayName?: string;
   /** Replaces the `${reply_style_guide}` block in the base system prompt. */
   readonly replyStyleGuide?: string;
+  /**
+   * Invocation-scoped adaptive execution mode. Artifacts may persist with a
+   * session, but search and evaluation run only while this host mode is enabled.
+   */
+  readonly adaptiveMode: AdaptiveHostMode;
 }
 
-/** {@link HostArgs} as accepted from the host: `requestHeaders` may be omitted. */
+/** {@link HostArgs} as accepted from the host: required fields may be omitted. */
 export interface HostArgsInput {
   readonly agentFiles?: readonly string[];
   readonly skillDirs?: readonly string[];
   readonly requestHeaders?: Readonly<Record<string, string>>;
   readonly displayName?: string;
   readonly replyStyleGuide?: string;
+  readonly adaptiveMode?: AdaptiveHostMode;
 }
 
 export function resolveHostArgs(input: HostArgsInput | undefined): HostArgs {
@@ -81,6 +89,7 @@ export function resolveHostArgs(input: HostArgsInput | undefined): HostArgs {
     requestHeaders: input?.requestHeaders ?? {},
     displayName: input?.displayName,
     replyStyleGuide: input?.replyStyleGuide,
+    adaptiveMode: input?.adaptiveMode ?? 'disabled',
   };
 }
 
@@ -107,7 +116,8 @@ export type PersistenceScopeName =
   | 'logs'
   | 'cache'
   | 'credentials'
-  | 'cron';
+  | 'cron'
+  | 'adaptive';
 
 export interface IBootstrapService {
   readonly _serviceBrand: undefined;
