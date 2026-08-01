@@ -1,4 +1,8 @@
-import { createDecorator } from '#/_base/di/instantiation';
+import {
+  createDecorator,
+  IInstantiationService,
+  type ServiceIdentifier,
+} from '#/_base/di/instantiation';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { defineState } from '#/_base/state/stateRegistry';
@@ -6,6 +10,7 @@ import { IAgentAdaptiveMemoryService } from '#/agent/adaptiveMemory/adaptiveMemo
 import { IAgentAdaptiveDirectiveService } from '#/agent/adaptivePrompt/adaptiveDirectiveService';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import { IAgentStateService } from '#/agent/state/agentState';
+import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { createEvidenceId } from './adaptiveProtocol';
 import { IAgentAdaptiveRuntimeService } from './adaptiveRuntime';
 import {
@@ -46,6 +51,45 @@ export const IAgentAdaptiveFinalResponseGateService =
   createDecorator<IAgentAdaptiveFinalResponseGateService>(
     'agentAdaptiveFinalResponseGateService',
   );
+
+const IAgentAdaptiveFinalResponseGateImplementation:
+  ServiceIdentifier<IAgentAdaptiveFinalResponseGateService> =
+  createDecorator<IAgentAdaptiveFinalResponseGateService>(
+    'agentAdaptiveFinalResponseGateImplementation',
+  );
+
+/**
+ * Stable loop dependency. The expensive verifier implementation is resolved
+ * only for an invocation whose frozen bootstrap mode is `enabled`.
+ */
+export class AgentAdaptiveFinalResponseGateFacade
+  implements IAgentAdaptiveFinalResponseGateService
+{
+  declare readonly _serviceBrand: undefined;
+  private implementationValue: IAgentAdaptiveFinalResponseGateService | undefined;
+
+  constructor(
+    @IBootstrapService private readonly bootstrap: IBootstrapService,
+    @IInstantiationService private readonly instantiation: IInstantiationService,
+  ) {}
+
+  allowCoordinatorPreparation(): boolean {
+    return this.implementation()?.allowCoordinatorPreparation() ?? true;
+  }
+
+  verifyAfterStep(): Promise<AdaptiveFinalResponseDecision> {
+    return this.implementation()?.verifyAfterStep() ??
+      Promise.resolve({ kind: 'not-applicable' });
+  }
+
+  private implementation(): IAgentAdaptiveFinalResponseGateService | undefined {
+    if (this.bootstrap.args.adaptiveMode !== 'enabled') return undefined;
+    this.implementationValue ??= this.instantiation.invokeFunction(
+      (accessor) => accessor.get(IAgentAdaptiveFinalResponseGateImplementation),
+    );
+    return this.implementationValue;
+  }
+}
 
 export class AgentAdaptiveFinalResponseGateService
   extends Disposable
@@ -232,7 +276,15 @@ function verificationSummary(verification: FinalResponseVerification): string {
 registerScopedService(
   LifecycleScope.Agent,
   IAgentAdaptiveFinalResponseGateService,
+  AgentAdaptiveFinalResponseGateFacade,
+  ScopeActivation.OnDemand,
+  'adaptiveFinalResponseGateFacade',
+);
+
+registerScopedService(
+  LifecycleScope.Agent,
+  IAgentAdaptiveFinalResponseGateImplementation,
   AgentAdaptiveFinalResponseGateService,
-  ScopeActivation.OnScopeCreated,
-  'adaptiveFinalResponseGate',
+  ScopeActivation.OnDemand,
+  'adaptiveFinalResponseGateImplementation',
 );
