@@ -24,6 +24,9 @@ export interface SearchOutcomePrediction {
   readonly candidateId: CandidateId;
   readonly modelWeight: number;
   readonly distribution: Readonly<Record<string, number>>;
+  readonly evaluatorFamily?: string;
+  readonly modelLineage?: string;
+  readonly effectiveSampleSize?: number;
 }
 
 export interface SearchAction {
@@ -56,6 +59,11 @@ export interface SearchState {
   readonly verifiedCandidateIds: readonly string[];
   readonly remainingBudget: AdaptiveBudget;
   readonly goalVersion: number;
+  readonly normalizedPosteriorEntropy?: number;
+  readonly openConflictCount?: number;
+  readonly viableModelCount?: number;
+  readonly taskFamily?: string;
+  readonly repositorySplit?: 'development' | 'confirmation' | 'promotion';
 }
 
 export interface SearchEdge {
@@ -98,6 +106,8 @@ export interface SearchSelection {
   readonly action: SearchAction;
   readonly score: number;
   readonly discoveryTemperature: number;
+  readonly policyBackend?: 'deterministic-cold-start' | 'promoted-linear-checkpoint';
+  readonly policyCheckpointHash?: string;
 }
 
 export interface SearchCommitAssessment {
