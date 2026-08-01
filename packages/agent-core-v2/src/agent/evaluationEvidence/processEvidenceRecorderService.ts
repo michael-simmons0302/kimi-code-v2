@@ -1,5 +1,7 @@
+import { setTimeout as delay } from 'node:timers/promises';
+
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
-import { createEvidenceId, type EvidenceId } from '#/agent/adaptiveRuntime/adaptiveProtocol';
+import { type EvidenceId } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import { IAgentAdaptiveRuntimeService } from '#/agent/adaptiveRuntime/adaptiveRuntime';
 import {
   IAgentProcessEvidenceRecorderImplementation,
@@ -7,6 +9,11 @@ import {
   type ProcessEvidenceRecorder,
   type ProcessEvidenceStart,
 } from '#/agent/evaluationEvidence/processEvidenceRecorder';
+import {
+  processExecutionEvidenceId,
+  toolCallEvidenceId,
+  toolResultEvidenceId,
+} from '#/agent/evaluationEvidence/toolEvidenceIds';
 import { requestIdForTrace } from '#/kosong/contract/requestTrace';
 import { IBlobStore } from '#/persistence/interface/blobStore';
 import {
@@ -16,7 +23,11 @@ import {
 } from '#/session/process/processEvidence';
 import { ISessionContext } from '#/session/sessionContext/sessionContext';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
+import { ISessionEvidenceGraphService } from '#/session/evaluationLedger/evidenceGraph';
 import type { ToolEvidenceEnvelope } from '#/tool/toolContract';
+
+const BACKGROUND_LINK_RETRIES = 50;
+const BACKGROUND_LINK_RETRY_MS = 20;
 
 export class AgentProcessEvidenceRecorderService
   implements IAgentProcessEvidenceRecorderService
@@ -30,6 +41,7 @@ export class AgentProcessEvidenceRecorderService
     @ISessionContext session: ISessionContext,
     @IBlobStore private readonly blobs: IBlobStore,
     @ISessionEvaluationLedgerService private readonly ledger: ISessionEvaluationLedgerService,
+    @ISessionEvidenceGraphService private readonly graph: ISessionEvidenceGraphService,
   ) {
     this.artifactScope = session.scope('adaptive/artifacts');
   }
@@ -82,7 +94,10 @@ export class AgentProcessEvidenceRecorderService
           combined: concatenate(combined),
           modelOutputBytes: settlement.modelOutputBytes,
         });
-        const evidenceId = createEvidenceId();
+        const evidenceId = processExecutionEvidenceId(
+          input.toolCallId,
+          input.trace?.traceId,
+        );
         const artifactRefs = await this.persistArtifacts(materialized);
         await this.ledger.append({
           recordType: 'process.execution.recorded',
@@ -96,9 +111,45 @@ export class AgentProcessEvidenceRecorderService
             artifactRefs,
           },
         });
+        if (input.background) {
+          await this.linkBackgroundEvidence(input, evidenceId);
+        }
         return toolEvidence(evidenceId, materialized.envelope, artifactRefs);
       },
     };
+  }
+
+  private async linkBackgroundEvidence(
+    input: ProcessEvidenceStart,
+    processEvidenceId: EvidenceId,
+  ): Promise<void> {
+    const callEvidenceId = toolCallEvidenceId(input.toolCallId, input.trace?.traceId);
+    const resultEvidenceId = toolResultEvidenceId(input.toolCallId, input.trace?.traceId);
+    for (let attempt = 0; attempt < BACKGROUND_LINK_RETRIES; attempt += 1) {
+      await this.graph.ready();
+      const [call, result, process] = await Promise.all([
+        this.graph.getNode(callEvidenceId),
+        this.graph.getNode(resultEvidenceId),
+        this.graph.getNode(processEvidenceId),
+      ]);
+      if (call !== undefined && result !== undefined && process !== undefined) {
+        await this.graph.appendLink({
+          fromEvidenceId: callEvidenceId,
+          toEvidenceId: processEvidenceId,
+          relation: 'caused',
+        });
+        await this.graph.appendLink({
+          fromEvidenceId: resultEvidenceId,
+          toEvidenceId: processEvidenceId,
+          relation: 'references',
+        });
+        return;
+      }
+      await delay(BACKGROUND_LINK_RETRY_MS);
+    }
+    throw new Error(
+      `Background process evidence could not resolve tool nodes for ${input.toolCallId}.`,
+    );
   }
 
   private async persistArtifacts(
