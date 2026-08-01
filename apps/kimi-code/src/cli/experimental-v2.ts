@@ -9,6 +9,7 @@
 import type { CLIOptions } from './options';
 
 export const KIMI_V2_ENV = 'KIMI_CODE_EXPERIMENTAL_FLAG';
+export const ADAPTIVE_HOST_MODE_GLOBAL = '__KIMI_CODE_ADAPTIVE_HOST_MODE__';
 
 const TRUTHY_VALUES = new Set(['1', 'true', 'yes', 'on']);
 let invocationOverride = false;
@@ -23,6 +24,12 @@ function isTruthyEnv(
 /** Set once by the CLI entrypoint after option validation. */
 export function setKimiV2InvocationOverride(enabled: boolean): void {
   invocationOverride = enabled;
+  Object.defineProperty(globalThis, ADAPTIVE_HOST_MODE_GLOBAL, {
+    value: enabled ? 'enabled' : 'disabled',
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
 }
 
 export function isKimiV2Enabled(
