@@ -32,6 +32,7 @@ export type EvaluationLedgerRecordType =
   | 'world_model.posterior.updated'
   | 'search.action.proposed'
   | 'search.action.selected'
+  | 'search.state.invalidated'
   | 'task.action.executed'
   | 'search.checkpoint.committed'
   | 'search.checkpoint.recovered'
