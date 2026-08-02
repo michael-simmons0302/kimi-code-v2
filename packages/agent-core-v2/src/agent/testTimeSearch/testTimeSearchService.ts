@@ -3,9 +3,12 @@ import { createHash } from 'node:crypto';
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import {
+  ADAPTIVE_ARCHITECTURE_VERSION,
+  ADAPTIVE_PROTOCOL_REGISTRY,
   createSearchDecisionId,
   createSearchEpisodeId,
   type AdaptiveBudget,
+  type AdaptiveCost,
   type SearchNodeId,
 } from '#/agent/adaptiveRuntime/adaptiveProtocol';
 import {
@@ -17,8 +20,8 @@ import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import {
   IWorldModelCalibrationService,
 } from '#/agent/worldModel/worldModelCalibration';
-import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
+import { ISessionSearchCheckpointService } from '#/session/searchCheckpoint/searchCheckpoint';
 import { calibratedDiscoveryInformationGain } from './calibratedDiscovery';
 import {
   decisionWeightedInformationGain,
@@ -35,7 +38,6 @@ import {
   type SearchPolicyActionEstimate,
   type SearchPolicyActionFeatures,
   type SearchPolicyStateFeatures,
-  type SearchPolicyValueEstimate,
 } from './searchPolicyValue';
 import {
   IAgentTestTimeSearchService,
@@ -48,8 +50,6 @@ import {
   type SearchState,
 } from './testTimeSearch';
 
-const CHECKPOINT_KEY = 'search-checkpoint.json';
-
 interface ParentReference {
   readonly parentNodeId: SearchNodeId;
   readonly actionId: string;
@@ -57,9 +57,8 @@ interface ParentReference {
 }
 
 interface PersistedSearchState {
-  readonly protocol: 'adaptive-search-checkpoint/1';
-  readonly configHash: string;
-  readonly episodeId?: ReturnType<typeof createSearchEpisodeId>;
+  readonly protocol: 'adaptive-search-state/1';
+  readonly episodeId: ReturnType<typeof createSearchEpisodeId>;
   readonly rootNodeId?: SearchNodeId;
   readonly nodes: readonly SearchNode[];
   readonly parents: readonly [SearchNodeId, ParentReference][];
@@ -82,7 +81,6 @@ export class AgentTestTimeSearchService
 {
   declare readonly _serviceBrand: undefined;
 
-  private readonly scope: string;
   private readonly config: AdaptiveConfigSnapshot;
   private readonly readyPromise: Promise<void>;
   private readonly nodeMap = new Map<SearchNodeId, SearchNode>();
@@ -93,20 +91,20 @@ export class AgentTestTimeSearchService
   private bestObservedValue = Number.NEGATIVE_INFINITY;
   private selectionsWithoutImprovement = 0;
   private mutation: Promise<void> = Promise.resolve();
+  private lastCheckpointSignature: string | undefined;
 
   constructor(
-    @IAgentScopeContext agent: IAgentScopeContext,
+    @IAgentScopeContext _agent: IAgentScopeContext,
     @IAgentAdaptiveRuntimeService private readonly runtime: IAgentAdaptiveRuntimeService,
     @ISessionAdaptiveConfigService adaptiveConfig: ISessionAdaptiveConfigService,
     @IAgentSearchPolicyValueService private readonly policyValue: IAgentSearchPolicyValueService,
     @IWorldModelCalibrationService private readonly calibration: IWorldModelCalibrationService,
-    @IAtomicDocumentStore private readonly documents: IAtomicDocumentStore,
+    @ISessionSearchCheckpointService
+    private readonly checkpoints: ISessionSearchCheckpointService,
     @ISessionEvaluationLedgerService private readonly ledger: ISessionEvaluationLedgerService,
   ) {
     super();
-    this.scope = agent.scope('adaptive');
     this.config = adaptiveConfig.snapshot();
-    this._register(this.documents.acquire(this.scope, CHECKPOINT_KEY));
     this.readyPromise = this.initialize();
   }
 
@@ -118,6 +116,7 @@ export class AgentTestTimeSearchService
     return this.mutate(async () => {
       this.runtime.ensureRun();
       this.runtime.transition('planning', 'Belief-state search initialized.');
+      this.resetForWorkspaceMismatch(state.workspaceSnapshotHash);
       const nodeId = stateId(
         state,
         this.config.config.search.budgetBucketPercent,
@@ -127,7 +126,7 @@ export class AgentTestTimeSearchService
         this.nodeMap.set(nodeId, decisionNode(nodeId, state, 0));
       }
       this.rootNodeId = nodeId;
-      await this.persist();
+      await this.persist('search-root-updated');
       return nodeId;
     });
   }
@@ -190,13 +189,13 @@ export class AgentTestTimeSearchService
         })),
       ];
       this.nodeMap.set(nodeId, { ...node, edges });
-      await this.persist();
       for (const action of selected) {
         await this.ledger.append({
           recordType: 'search.action.proposed',
           payload: { episodeId: this.episodeId, nodeId, action },
         });
       }
+      await this.persist('search-actions-added');
     });
   }
 
@@ -248,7 +247,7 @@ export class AgentTestTimeSearchService
           policyStateValueUncertainty: policy.stateValueUncertainty,
         },
       });
-      await this.persist();
+      await this.persist('search-action-selected');
       return selection;
     });
   }
@@ -314,7 +313,6 @@ export class AgentTestTimeSearchService
       } else {
         this.selectionsWithoutImprovement += 1;
       }
-      await this.persist();
       await this.policyValue.recordExperience({
         protocol: SEARCH_EXPERIENCE_PROTOCOL,
         sequence: this.selectionCount,
@@ -329,6 +327,7 @@ export class AgentTestTimeSearchService
         taskFamily: node.state.taskFamily ?? 'unknown',
         repositorySplit: node.state.repositorySplit ?? 'development',
       });
+      await this.persist('search-outcome-observed');
       return childNodeId;
     });
   }
@@ -381,11 +380,13 @@ export class AgentTestTimeSearchService
 
   checkpoint(): Promise<void> {
     return this.mutate(async () => {
-      await this.persist();
+      const checkpoint = await this.persist('explicit-search-checkpoint', true);
       await this.policyValue.flush();
       await this.ledger.append({
         recordType: 'search.checkpoint.committed',
         payload: {
+          checkpointId: checkpoint?.checkpointId,
+          checkpointHash: checkpoint?.checkpointHash,
           episodeId: this.episodeId,
           rootNodeId: this.rootNodeId,
           nodeCount: this.nodeMap.size,
@@ -402,6 +403,7 @@ export class AgentTestTimeSearchService
     await this.readyPromise;
     await this.mutation;
     await Promise.all([
+      this.checkpoints.flush(),
       this.policyValue.flush(),
       this.calibration.flush(),
       this.ledger.flush(),
@@ -415,6 +417,7 @@ export class AgentTestTimeSearchService
 
   private async initialize(): Promise<void> {
     await Promise.all([
+      this.checkpoints.ready(),
       this.policyValue.ready(),
       this.calibration.ready(),
       this.ledger.ready(),
@@ -483,29 +486,40 @@ export class AgentTestTimeSearchService
   }
 
   private async restore(): Promise<void> {
-    const persisted = await this.documents.get<PersistedSearchState>(
-      this.scope,
-      CHECKPOINT_KEY,
-    );
-    if (
-      persisted?.protocol !== 'adaptive-search-checkpoint/1' ||
-      persisted.configHash !== this.config.hash
-    ) {
-      return;
+    const recovery = await this.checkpoints.recover<PersistedSearchState>({
+      architectureVersion: ADAPTIVE_ARCHITECTURE_VERSION,
+      protocolVersions: ADAPTIVE_PROTOCOL_REGISTRY,
+      configHash: this.config.hash,
+    });
+    const checkpoint = recovery.checkpoint;
+    if (checkpoint === undefined) return;
+    const persisted = checkpoint.state;
+    if (persisted.protocol !== 'adaptive-search-state/1') {
+      throw new Error(`Unsupported persisted search state: ${String(persisted.protocol)}`);
     }
-    this.episodeId = persisted.episodeId ?? createSearchEpisodeId();
+    this.episodeId = persisted.episodeId;
     this.rootNodeId = persisted.rootNodeId;
     for (const node of persisted.nodes) this.nodeMap.set(node.nodeId, node);
     for (const [nodeId, parent] of persisted.parents) this.parents.set(nodeId, parent);
     this.selectionCount = persisted.selectionCount;
     this.bestObservedValue = persisted.bestObservedValue;
     this.selectionsWithoutImprovement = persisted.selectionsWithoutImprovement;
+    this.lastCheckpointSignature = checkpointSignature(
+      checkpoint.ledgerHeadHash,
+      checkpoint.state,
+    );
   }
 
-  private persist(): Promise<void> {
-    const payload: PersistedSearchState = {
-      protocol: 'adaptive-search-checkpoint/1',
-      configHash: this.config.hash,
+  private async persist(
+    reason: string,
+    force = false,
+  ): Promise<ReturnType<ISessionSearchCheckpointService['latest']>> {
+    const ledgerHead = this.ledger.head();
+    if (ledgerHead.recordHash === null) {
+      throw new Error('Search state cannot checkpoint before the evidence ledger has a head.');
+    }
+    const state: PersistedSearchState = {
+      protocol: 'adaptive-search-state/1',
       episodeId: this.episodeId,
       rootNodeId: this.rootNodeId,
       nodes: this.nodes(),
@@ -514,7 +528,60 @@ export class AgentTestTimeSearchService
       bestObservedValue: this.bestObservedValue,
       selectionsWithoutImprovement: this.selectionsWithoutImprovement,
     };
-    return this.documents.set(this.scope, CHECKPOINT_KEY, payload);
+    const signature = checkpointSignature(ledgerHead.recordHash, state);
+    if (!force && signature === this.lastCheckpointSignature) {
+      return this.checkpoints.latest();
+    }
+    const root = this.root();
+    const checkpoint = await this.checkpoints.commit({
+      ledgerHeadHash: ledgerHead.recordHash,
+      createdAtSequence: ledgerHead.sequence,
+      architectureVersion: ADAPTIVE_ARCHITECTURE_VERSION,
+      protocolVersions: ADAPTIVE_PROTOCOL_REGISTRY,
+      configHash: this.config.hash,
+      workspaceSnapshotHash: root?.state.workspaceSnapshotHash,
+      state,
+      budget: this.config.config.budget,
+      cost: root === undefined
+        ? emptyCost()
+        : costFromRemaining(root.state.remainingBudget, this.config.config.budget),
+      randomStates: [{
+        generatorId: 'search-selection-sequence',
+        state: String(this.selectionCount),
+      }],
+      activeEvaluators: [],
+      frontierTemperature:
+        root?.kind === 'decision'
+          ? this.discoveryTemperature(root)
+          : this.config.config.search.defaultDiscoveryTemperature,
+      transpositions: {
+        entries: this.nodeMap.size,
+        hits: 0,
+        evictions: 0,
+        hash: createHash('sha256').update(canonicalJson(this.nodes())).digest('hex'),
+      },
+      reason,
+    });
+    this.lastCheckpointSignature = signature;
+    return checkpoint;
+  }
+
+  private resetForWorkspaceMismatch(workspaceSnapshotHash: string): void {
+    const restored = this.root();
+    if (
+      restored === undefined ||
+      restored.state.workspaceSnapshotHash === workspaceSnapshotHash
+    ) {
+      return;
+    }
+    this.nodeMap.clear();
+    this.parents.clear();
+    this.episodeId = createSearchEpisodeId();
+    this.rootNodeId = undefined;
+    this.selectionCount = 0;
+    this.bestObservedValue = Number.NEGATIVE_INFINITY;
+    this.selectionsWithoutImprovement = 0;
+    this.lastCheckpointSignature = undefined;
   }
 
   private remainingBudgetFraction(state: SearchState): number {
@@ -849,6 +916,52 @@ function remainingBudgetFraction(
     return clamp01(value / maximum);
   });
   return fractions.length === 0 ? 0 : Math.min(...fractions);
+}
+
+function costFromRemaining(
+  remaining: AdaptiveBudget,
+  configured: AdaptiveBudget,
+): AdaptiveCost {
+  return {
+    internalRequests: spent(configured.maxInternalRequests, remaining.maxInternalRequests),
+    evaluations: spent(configured.maxEvaluations, remaining.maxEvaluations),
+    stochasticReplicates: spent(
+      configured.maxStochasticReplicates,
+      remaining.maxStochasticReplicates,
+    ),
+    toolCalls: spent(configured.maxToolCalls, remaining.maxToolCalls),
+    inputTokens: spent(configured.maxInputTokens, remaining.maxInputTokens),
+    outputTokens: spent(configured.maxOutputTokens, remaining.maxOutputTokens),
+    wallMs: spent(configured.maxWallMs, remaining.maxWallMs),
+    cpuMs: spent(configured.maxCpuMs, remaining.maxCpuMs),
+    diskBytes: spent(configured.maxDiskBytes, remaining.maxDiskBytes),
+  };
+}
+
+function spent(configured: number, remaining: number): number {
+  return Math.max(0, configured - remaining);
+}
+
+function emptyCost(): AdaptiveCost {
+  return {
+    internalRequests: 0,
+    evaluations: 0,
+    stochasticReplicates: 0,
+    toolCalls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    wallMs: 0,
+    cpuMs: 0,
+    diskBytes: 0,
+  };
+}
+
+function checkpointSignature(ledgerHeadHash: string, state: PersistedSearchState): string {
+  return createHash('sha256')
+    .update(ledgerHeadHash)
+    .update('\u0000')
+    .update(canonicalJson(state))
+    .digest('hex');
 }
 
 function visitDistribution(edges: readonly SearchEdge[]): Readonly<Record<string, number>> {
