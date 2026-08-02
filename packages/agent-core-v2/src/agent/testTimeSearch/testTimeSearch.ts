@@ -141,7 +141,6 @@ export interface IAgentTestTimeSearchService {
   root(): SearchNode | undefined;
   node(nodeId: SearchNodeId): SearchNode | undefined;
   nodes(): readonly SearchNode[];
-  invalidate(reason: string): Promise<void>;
   checkpoint(): Promise<void>;
   flush(): Promise<void>;
 }
