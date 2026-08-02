@@ -5,16 +5,10 @@ import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { IAgentAdaptiveMemoryService } from '#/agent/adaptiveMemory/adaptiveMemory';
 import { IAgentAdaptiveDirectiveService } from '#/agent/adaptivePrompt/adaptiveDirectiveService';
-import {
-  adaptiveCoordinatorStateKey,
-} from '#/agent/adaptiveRuntime/adaptiveCoordinatorService';
-import {
-  adaptiveFinalResponseGateStateKey,
-} from '#/agent/adaptiveRuntime/adaptiveFinalResponseGateService';
+import { adaptiveCoordinatorStateKey } from '#/agent/adaptiveRuntime/adaptiveCoordinatorService';
+import { adaptiveFinalResponseGateStateKey } from '#/agent/adaptiveRuntime/adaptiveFinalResponseGateService';
 import { IAgentAdaptiveRuntimeService } from '#/agent/adaptiveRuntime/adaptiveRuntime';
-import {
-  IAgentConversationUndoParticipantRegistry,
-} from '#/agent/contextMemory/conversationUndoParticipants';
+import { IAgentConversationUndoParticipantRegistry } from '#/agent/contextMemory/conversationUndoParticipants';
 import { IAgentFullCompactionService } from '#/agent/fullCompaction/fullCompaction';
 import { IAgentStateService } from '#/agent/state/agentState';
 import { IAgentTestTimeSearchService } from '#/agent/testTimeSearch/testTimeSearch';
@@ -69,7 +63,10 @@ export class AgentAdaptiveLifecycleService
         priority: 40,
         prepare: async () => ({
           commit: async () => {
-            await this.invalidateTaskState('Conversation history was undone.');
+            await this.invalidateTaskState(
+              'Conversation history was undone.',
+              true,
+            );
           },
           rollback: async () => {},
         }),
@@ -85,7 +82,7 @@ export class AgentAdaptiveLifecycleService
               recordType: 'adaptive.context.compacted',
               adaptiveRunId: this.runtime.runId(),
               payload: {
-                source: task.trigger,
+                compactionTaskId: task.taskId,
                 compactedCount: result.compactedCount,
                 tokensBefore: result.tokensBefore,
                 tokensAfter: result.tokensAfter,
@@ -120,6 +117,7 @@ export class AgentAdaptiveLifecycleService
     }
     return this.invalidateTaskState(
       `Session forked from ${sourceSessionId}; copied task-time state requires revalidation.`,
+      false,
     );
   }
 
@@ -132,7 +130,10 @@ export class AgentAdaptiveLifecycleService
     ]);
   }
 
-  private async invalidateTaskState(reason: string): Promise<void> {
+  private async invalidateTaskState(
+    reason: string,
+    recordUndo: boolean,
+  ): Promise<void> {
     if (!this.runtime.enabled()) return;
     await Promise.all([
       this.ledger.ready(),
@@ -142,15 +143,17 @@ export class AgentAdaptiveLifecycleService
     ]);
     const current = this.states.get(adaptiveCoordinatorStateKey);
     const nextGoalVersion = current.goalVersion + 1;
-    await this.ledger.append({
-      recordType: 'adaptive.context.undone',
-      adaptiveRunId: this.runtime.runId(),
-      payload: {
-        reason,
-        previousGoalVersion: current.goalVersion,
-        nextGoalVersion,
-      },
-    });
+    if (recordUndo) {
+      await this.ledger.append({
+        recordType: 'adaptive.context.undone',
+        adaptiveRunId: this.runtime.runId(),
+        payload: {
+          reason,
+          previousGoalVersion: current.goalVersion,
+          nextGoalVersion,
+        },
+      });
+    }
     this.states.set(adaptiveCoordinatorStateKey, {
       initialized: false,
       runRecorded: false,
