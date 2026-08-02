@@ -4,6 +4,7 @@ import type { AdaptivePromptPhase } from '#/agent/adaptivePrompt/adaptivePromptL
 import { IAgentStateService } from '#/agent/state/agentState';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { IEventBus } from '#/app/event/eventBus';
+import { ISessionAdaptiveConfigService } from './adaptiveConfigService';
 import {
   IAgentAdaptiveRuntimeImplementation,
   type IAgentAdaptiveRuntimeService,
@@ -11,7 +12,6 @@ import {
   type AdaptivePhaseTransition,
 } from './adaptiveRuntime';
 import {
-  DEFAULT_ADAPTIVE_BUDGET,
   createAdaptiveRunId,
   emptyAdaptiveCost,
   remainingBudgetFraction,
@@ -35,9 +35,8 @@ interface AdaptiveRuntimeState {
   readonly cost: AdaptiveCost;
 }
 
-export const adaptiveRuntimeStateKey = defineState<AdaptiveRuntimeState>(
-  'adaptiveRuntime.state',
-  () => ({
+function emptyState(): AdaptiveRuntimeState {
+  return {
     phase: 'inactive',
     evaluationsCompleted: 0,
     evaluationsActive: 0,
@@ -47,7 +46,12 @@ export const adaptiveRuntimeStateKey = defineState<AdaptiveRuntimeState>(
     decisionWeightedUncertainty: 0,
     verifiedCandidates: 0,
     cost: emptyAdaptiveCost(),
-  }),
+  };
+}
+
+export const adaptiveRuntimeStateKey = defineState<AdaptiveRuntimeState>(
+  'adaptiveRuntime.state',
+  emptyState,
 );
 
 const VALID_TRANSITIONS: Readonly<Record<AdaptivePhase, readonly AdaptivePhase[]>> = {
@@ -56,7 +60,7 @@ const VALID_TRANSITIONS: Readonly<Record<AdaptivePhase, readonly AdaptivePhase[]
   indexing: ['discovering', 'modeling', 'evaluating', 'blocked', 'cancelled', 'infrastructure-failed'],
   discovering: ['modeling', 'evaluating', 'planning', 'blocked', 'cancelled', 'budget-exhausted'],
   modeling: ['discovering', 'evaluating', 'planning', 'no-viable-model', 'cancelled', 'budget-exhausted'],
-  evaluating: ['discovering', 'modeling', 'planning', 'reconciling', 'blocked', 'cancelled', 'budget-exhausted', 'infrastructure-failed'],
+  evaluating: ['discovering', 'modeling', 'planning', 'reconciling', 'committing', 'blocked', 'cancelled', 'budget-exhausted', 'infrastructure-failed'],
   planning: ['discovering', 'modeling', 'evaluating', 'acting', 'committing', 'blocked', 'cancelled', 'budget-exhausted'],
   acting: ['reconciling', 'blocked', 'cancelled', 'infrastructure-failed'],
   reconciling: ['discovering', 'modeling', 'evaluating', 'planning', 'committing', 'blocked', 'cancelled', 'evidence-corrupted'],
@@ -76,6 +80,7 @@ export class AgentAdaptiveRuntimeService implements IAgentAdaptiveRuntimeService
 
   constructor(
     @IBootstrapService private readonly bootstrap: IBootstrapService,
+    @ISessionAdaptiveConfigService private readonly adaptiveConfig: ISessionAdaptiveConfigService,
     @IAgentStateService private readonly states: IAgentStateService,
     @IEventBus private readonly events: IEventBus,
   ) {
@@ -94,7 +99,7 @@ export class AgentAdaptiveRuntimeService implements IAgentAdaptiveRuntimeService
     if (!this.enabled()) return undefined;
     if (this.state.runId !== undefined) return this.state.runId;
     const runId = createAdaptiveRunId();
-    this.state = { ...this.state, runId, phase: 'initializing' };
+    this.state = { ...emptyState(), runId, phase: 'initializing' };
     this.events.publish({ type: 'adaptive.run.started', runId });
     this.publishStatus();
     return runId;
@@ -181,9 +186,24 @@ export class AgentAdaptiveRuntimeService implements IAgentAdaptiveRuntimeService
       openConflicts: state.openConflicts,
       normalizedPosteriorEntropy: state.normalizedPosteriorEntropy,
       decisionWeightedUncertainty: state.decisionWeightedUncertainty,
-      remainingBudgetFraction: remainingBudgetFraction(DEFAULT_ADAPTIVE_BUDGET, state.cost),
+      remainingBudgetFraction: remainingBudgetFraction(
+        this.adaptiveConfig.snapshot().config.budget,
+        state.cost,
+      ),
       verifiedCandidates: state.verifiedCandidates,
     };
+  }
+
+  reset(reason: string): void {
+    const previousRunId = this.state.runId;
+    this.state = emptyState();
+    if (previousRunId !== undefined) {
+      this.events.publish({
+        type: 'adaptive.run.cancelled',
+        runId: previousRunId,
+        reason,
+      });
+    }
   }
 
   complete(reason: string): void {
