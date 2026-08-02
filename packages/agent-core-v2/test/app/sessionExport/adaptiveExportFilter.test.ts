@@ -62,10 +62,11 @@ describe('filterAdaptiveExportFiles', () => {
     );
 
     expect(result.included).toEqual([ordinary]);
-    const counts = Object.groupBy(result.excluded, ({ reason }) => reason);
-    expect(counts['transient-path']).toHaveLength(3);
-    expect(counts['credential-like-file']).toHaveLength(3);
-    expect(counts['protected-artifact']).toHaveLength(1);
+    expect(result.excluded.filter(({ reason }) => reason === 'transient-path')).toHaveLength(3);
+    expect(
+      result.excluded.filter(({ reason }) => reason === 'credential-like-file'),
+    ).toHaveLength(3);
+    expect(result.excluded.filter(({ reason }) => reason === 'protected-artifact')).toHaveLength(1);
   });
 
   it('rejects paths that escape the session root', () => {
