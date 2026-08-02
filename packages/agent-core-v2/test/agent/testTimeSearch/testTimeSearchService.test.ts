@@ -1,7 +1,7 @@
+import { createHash } from 'node:crypto';
+
 import { describe, expect, it } from 'vitest';
 
-import type { IDisposable } from '#/_base/di/lifecycle';
-import type { Event } from '#/_base/event';
 import {
   DEFAULT_ADAPTIVE_CONFIG,
   type AdaptiveConfig,
@@ -33,49 +33,40 @@ import type {
   CalibrationSnapshot,
   IWorldModelCalibrationService,
 } from '#/agent/worldModel/worldModelCalibration';
-import type { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import type {
   AppendEvaluationLedgerInput,
   EvaluationLedgerHead,
   EvaluationLedgerRecord,
   ISessionEvaluationLedgerService,
 } from '#/session/evaluationLedger/evaluationLedger';
-
-class Documents implements IAtomicDocumentStore {
-  declare readonly _serviceBrand: undefined;
-  readonly values = new Map<string, unknown>();
-  async get<T>(scope: string, key: string): Promise<T | undefined> {
-    return structuredClone(this.values.get(`${scope}/${key}`)) as T | undefined;
-  }
-  async set<T>(scope: string, key: string, value: T): Promise<void> {
-    this.values.set(`${scope}/${key}`, structuredClone(value));
-  }
-  async delete(scope: string, key: string): Promise<void> {
-    this.values.delete(`${scope}/${key}`);
-  }
-  async list(scope: string, prefix = ''): Promise<readonly string[]> {
-    const start = `${scope}/`;
-    return [...this.values.keys()]
-      .filter((key) => key.startsWith(start))
-      .map((key) => key.slice(start.length))
-      .filter((key) => key.startsWith(prefix));
-  }
-  watch(): Event<void> { return () => ({ dispose() {} }); }
-  acquire(): IDisposable { return { dispose() {} }; }
-}
+import type {
+  ISessionSearchCheckpointService,
+  SearchCheckpoint,
+  SearchCheckpointCompatibility,
+  SearchCheckpointInput,
+  SearchCheckpointRecovery,
+} from '#/session/searchCheckpoint/searchCheckpoint';
 
 class Ledger implements ISessionEvaluationLedgerService {
   declare readonly _serviceBrand: undefined;
-  readonly values: EvaluationLedgerRecord[] = [];
+  readonly values: EvaluationLedgerRecord[] = [{
+    protocol: 'adaptive-ledger/1',
+    sequence: 1,
+    previousRecordHash: null,
+    recordHash: hash('seed'),
+    recordType: 'adaptive.run.started',
+    payload: {},
+  }];
   async ready(): Promise<void> {}
   async append<TPayload>(
     input: AppendEvaluationLedgerInput<TPayload>,
   ): Promise<EvaluationLedgerRecord<TPayload>> {
+    const sequence = this.values.length + 1;
     const record: EvaluationLedgerRecord<TPayload> = {
       protocol: 'adaptive-ledger/1',
-      sequence: this.values.length + 1,
+      sequence,
       previousRecordHash: this.values.at(-1)?.recordHash ?? null,
-      recordHash: `record-${String(this.values.length + 1)}`,
+      recordHash: hash(`${String(sequence)}:${input.recordType}`),
       recordType: input.recordType,
       adaptiveRunId: input.adaptiveRunId,
       evidenceId: input.evidenceId,
@@ -93,6 +84,48 @@ class Ledger implements ISessionEvaluationLedgerService {
     };
   }
   async verify() { return { valid: true, records: this.values.length, head: this.head() }; }
+  async flush(): Promise<void> {}
+}
+
+class Checkpoints implements ISessionSearchCheckpointService {
+  declare readonly _serviceBrand: undefined;
+  readonly values: SearchCheckpoint[] = [];
+  async ready(): Promise<void> {}
+  async commit<TState>(input: SearchCheckpointInput<TState>): Promise<SearchCheckpoint<TState>> {
+    const sequence = this.values.length + 1;
+    const checkpoint: SearchCheckpoint<TState> = {
+      protocol: 'adaptive-search-checkpoint/1',
+      checkpointId: `checkpoint-${String(sequence)}`,
+      previousCheckpointHash: this.values.at(-1)?.checkpointHash ?? null,
+      ...structuredClone(input),
+      checkpointHash: hash(`checkpoint-${String(sequence)}:${input.ledgerHeadHash}`),
+    };
+    this.values.push(checkpoint as SearchCheckpoint);
+    return checkpoint;
+  }
+  latest<TState = unknown>(): SearchCheckpoint<TState> | undefined {
+    return this.values.at(-1) as SearchCheckpoint<TState> | undefined;
+  }
+  async recover<TState = unknown>(
+    compatibility: SearchCheckpointCompatibility,
+  ): Promise<SearchCheckpointRecovery<TState>> {
+    const checkpoint = [...this.values].reverse().find((value) =>
+      value.architectureVersion === compatibility.architectureVersion &&
+      sameRecord(value.protocolVersions, compatibility.protocolVersions) &&
+      (compatibility.configHash === undefined || value.configHash === compatibility.configHash) &&
+      (
+        compatibility.workspaceSnapshotHash === undefined ||
+        value.workspaceSnapshotHash === compatibility.workspaceSnapshotHash
+      ),
+    );
+    return {
+      checkpoint: checkpoint as SearchCheckpoint<TState> | undefined,
+      recoveredFromPrior: false,
+      exactRequestedHead: checkpoint !== undefined,
+      rejected: [],
+    };
+  }
+  list(): readonly SearchCheckpoint[] { return [...this.values]; }
   async flush(): Promise<void> {}
 }
 
@@ -266,7 +299,7 @@ function action(
 
 function fixture(
   adaptiveConfig: ISessionAdaptiveConfigService = config(),
-  documents = new Documents(),
+  checkpoints = new Checkpoints(),
 ) {
   const runtime = new Runtime();
   const policy = new Policy();
@@ -278,10 +311,10 @@ function fixture(
     adaptiveConfig,
     policy,
     calibration,
-    documents,
+    checkpoints,
     ledger,
   );
-  return { service, runtime, policy, calibration, ledger, documents };
+  return { service, runtime, policy, calibration, ledger, checkpoints };
 }
 
 function disagreeingPredictions(lineage: string) {
@@ -388,18 +421,57 @@ describe('AgentTestTimeSearchService integration', () => {
     ]);
   });
 
+  it('restores a compatible search state from the production checkpoint chain', async () => {
+    const checkpoints = new Checkpoints();
+    const first = fixture(config(), checkpoints);
+    const root = await first.service.begin(state());
+    await first.service.addActions(root, [action('a')]);
+    await first.service.flush();
+
+    const second = fixture(config(), checkpoints);
+    await second.service.ready();
+    expect(second.service.root()?.nodeId).toBe(root);
+    expect(second.service.nodes()).toHaveLength(1);
+  });
+
   it('refuses to restore search state produced by a different config snapshot', async () => {
-    const documents = new Documents();
-    const first = fixture(config(), documents);
+    const checkpoints = new Checkpoints();
+    const first = fixture(config(), checkpoints);
     const root = await first.service.begin(state());
     await first.service.addActions(root, [action('a')]);
     await first.service.flush();
 
     const second = fixture(config((value) => {
       value.search.cPuct = 9;
-    }), documents);
+    }), checkpoints);
     await second.service.ready();
     expect(second.service.root()).toBeUndefined();
     expect(second.service.nodes()).toHaveLength(0);
   });
+
+  it('starts a new episode when the resumed workspace snapshot changed', async () => {
+    const checkpoints = new Checkpoints();
+    const first = fixture(config(), checkpoints);
+    const firstRoot = await first.service.begin(state({ workspaceSnapshotHash: 'workspace-a' }));
+    await first.service.addActions(firstRoot, [action('a')]);
+    await first.service.flush();
+
+    const second = fixture(config(), checkpoints);
+    await second.service.ready();
+    const secondRoot = await second.service.begin(state({ workspaceSnapshotHash: 'workspace-b' }));
+    expect(secondRoot).not.toBe(firstRoot);
+    expect(second.service.nodes()).toHaveLength(1);
+  });
 });
+
+function hash(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function sameRecord(
+  left: Readonly<Record<string, string>>,
+  right: Readonly<Record<string, string>>,
+): boolean {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  return [...keys].every((key) => left[key] === right[key]);
+}
