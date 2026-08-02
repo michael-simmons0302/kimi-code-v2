@@ -18,6 +18,7 @@ const DROPPED_DOMAIN_EVENT_TYPES: ReadonlySet<string> = new Set([
   'adaptive.run.started',
   'adaptive.phase.changed',
   'adaptive.run.completed',
+  'adaptive.run.cancelled',
   'adaptive.run.failed',
 ]);
 
