@@ -17,9 +17,7 @@ import {
 } from '#/agent/adaptiveRuntime/adaptiveConfigService';
 import { IAgentAdaptiveRuntimeService } from '#/agent/adaptiveRuntime/adaptiveRuntime';
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
-import {
-  IWorldModelCalibrationService,
-} from '#/agent/worldModel/worldModelCalibration';
+import { IWorldModelCalibrationService } from '#/agent/worldModel/worldModelCalibration';
 import { ISessionEvaluationLedgerService } from '#/session/evaluationLedger/evaluationLedger';
 import { ISessionSearchCheckpointService } from '#/session/searchCheckpoint/searchCheckpoint';
 import { calibratedDiscoveryInformationGain } from './calibratedDiscovery';
@@ -99,8 +97,7 @@ export class AgentTestTimeSearchService
     @ISessionAdaptiveConfigService adaptiveConfig: ISessionAdaptiveConfigService,
     @IAgentSearchPolicyValueService private readonly policyValue: IAgentSearchPolicyValueService,
     @IWorldModelCalibrationService private readonly calibration: IWorldModelCalibrationService,
-    @ISessionSearchCheckpointService
-    private readonly checkpoints: ISessionSearchCheckpointService,
+    @ISessionSearchCheckpointService private readonly checkpoints: ISessionSearchCheckpointService,
     @ISessionEvaluationLedgerService private readonly ledger: ISessionEvaluationLedgerService,
   ) {
     super();
@@ -117,10 +114,7 @@ export class AgentTestTimeSearchService
       this.runtime.ensureRun();
       this.runtime.transition('planning', 'Belief-state search initialized.');
       this.resetForWorkspaceMismatch(state.workspaceSnapshotHash);
-      const nodeId = stateId(
-        state,
-        this.config.config.search.budgetBucketPercent,
-      );
+      const nodeId = stateId(state, this.config.config.search.budgetBucketPercent);
       if (!this.nodeMap.has(nodeId)) {
         this.ensureCapacity();
         this.nodeMap.set(nodeId, decisionNode(nodeId, state, 0));
@@ -165,7 +159,7 @@ export class AgentTestTimeSearchService
         allowed,
         search.actionCategoryMaximumFraction,
       );
-      const remainingBudgetFraction = this.remainingBudgetFraction(node.state);
+      const remainingBudget = this.remainingBudgetFraction(node.state);
       const edges = [
         ...node.edges,
         ...selected.map((action): SearchEdge => ({
@@ -177,7 +171,7 @@ export class AgentTestTimeSearchService
             action,
             temperature,
             discoveryWeight,
-            remainingBudgetFraction,
+            remainingBudget,
             search.discoveryBonusCapFraction,
             this.calibration,
           ).total,
@@ -272,14 +266,8 @@ export class AgentTestTimeSearchService
       const visits = previous.visits + 1;
       let childNodeId: SearchNodeId | undefined;
       let childNodeIds = previous.childNodeIds;
-      if (
-        nextState !== undefined &&
-        node.depth < this.config.config.search.maximumDepth
-      ) {
-        childNodeId = stateId(
-          nextState,
-          this.config.config.search.budgetBucketPercent,
-        );
+      if (nextState !== undefined && node.depth < this.config.config.search.maximumDepth) {
+        childNodeId = stateId(nextState, this.config.config.search.budgetBucketPercent);
         if (!this.nodeMap.has(childNodeId)) {
           this.ensureCapacity();
           this.nodeMap.set(childNodeId, decisionNode(childNodeId, nextState, node.depth + 1));
@@ -376,6 +364,37 @@ export class AgentTestTimeSearchService
     return [...this.nodeMap.values()].sort((left, right) =>
       left.nodeId.localeCompare(right.nodeId),
     );
+  }
+
+  invalidate(reason: string): Promise<void> {
+    return this.mutate(async () => {
+      if (reason.trim().length === 0) {
+        throw new Error('Search invalidation reason cannot be empty.');
+      }
+      const previousEpisodeId = this.episodeId;
+      const previousRootNodeId = this.rootNodeId;
+      const previousNodeCount = this.nodeMap.size;
+      this.nodeMap.clear();
+      this.parents.clear();
+      this.episodeId = createSearchEpisodeId();
+      this.rootNodeId = undefined;
+      this.selectionCount = 0;
+      this.bestObservedValue = Number.NEGATIVE_INFINITY;
+      this.selectionsWithoutImprovement = 0;
+      this.lastCheckpointSignature = undefined;
+      await this.ledger.append({
+        recordType: 'search.state.invalidated',
+        adaptiveRunId: this.runtime.runId(),
+        payload: {
+          reason,
+          previousEpisodeId,
+          previousRootNodeId,
+          previousNodeCount,
+          nextEpisodeId: this.episodeId,
+        },
+      });
+      await this.persist(`search-invalidated:${reason}`, true);
+    });
   }
 
   checkpoint(): Promise<void> {
@@ -703,17 +722,13 @@ function puctScore(
   config: AdaptiveConfigSnapshot,
   calibration: IWorldModelCalibrationService,
 ): number {
-  const expectedTaskProgress =
-    edge.action.expectedTaskValue + 0.3 * edge.action.expectedProgress;
+  const expectedTaskProgress = edge.action.expectedTaskValue + 0.3 * edge.action.expectedProgress;
   const exploitation = edge.visits > 0
     ? edge.meanValue
     : estimate?.value ?? expectedTaskProgress;
   const prior = estimate?.prior ?? clamp01(edge.action.prior);
   const exploration =
-    config.config.search.cPuct *
-    prior *
-    Math.sqrt(1 + node.visits) /
-    (1 + edge.visits);
+    config.config.search.cPuct * prior * Math.sqrt(1 + node.visits) / (1 + edge.visits);
   const frontier = frontierForAction(
     edge.action,
     temperature,
@@ -722,15 +737,14 @@ function puctScore(
     config.config.search.discoveryBonusCapFraction,
     calibration,
   );
-  const frontierAdjustment = frontier.total - expectedTaskProgress;
-  return exploitation + exploration + frontierAdjustment;
+  return exploitation + exploration + frontier.total - expectedTaskProgress;
 }
 
 function frontierForAction(
   action: SearchAction,
   temperature: number,
   discoveryWeight: number,
-  remainingBudgetFraction: number,
+  remainingBudgetFractionValue: number,
   discoveryBonusCapFraction: number,
   calibration: IWorldModelCalibrationService,
 ) {
@@ -743,7 +757,7 @@ function frontierForAction(
     executionRisk: action.executionRisk,
     redundancyPenalty: action.redundancyPenalty,
     calibrationPenalty: metrics.calibrationPenalty,
-    remainingBudgetFraction,
+    remainingBudgetFraction: remainingBudgetFractionValue,
     discoveryWeight,
     discoveryBonusCapFraction,
   });
@@ -754,9 +768,7 @@ function actionMetrics(
   temperature: number,
   calibration: IWorldModelCalibrationService,
 ): ActionMetrics {
-  const expectedTaskProgress = finite(
-    action.expectedTaskValue + 0.3 * action.expectedProgress,
-  );
+  const expectedTaskProgress = finite(action.expectedTaskValue + 0.3 * action.expectedProgress);
   const predictions = action.predictions;
   let information = 0;
   let calibrationPenalty = 1 - clamp01(action.calibrationFactor);
@@ -793,8 +805,7 @@ function actionMetrics(
           modelLineage: prediction.modelLineage as string,
           posteriorWeight: prediction.modelWeight,
           informationGain: decisionWeighted,
-          effectiveSampleSize:
-            prediction.effectiveSampleSize ?? effectiveSampleSize,
+          effectiveSampleSize: prediction.effectiveSampleSize ?? effectiveSampleSize,
         })),
         calibration,
       );
@@ -832,13 +843,11 @@ function predictedOutcomeProbabilities(
     ) || 1;
     for (const [outcome, probability] of Object.entries(prediction.distribution)) {
       result[outcome] =
-        (result[outcome] ?? 0) +
-        weight * Math.max(0, probability) / distributionTotal;
+        (result[outcome] ?? 0) + weight * Math.max(0, probability) / distributionTotal;
     }
   });
   const ranked = Object.entries(result).sort(
-    ([leftKey, left], [rightKey, right]) =>
-      right - left || leftKey.localeCompare(rightKey),
+    ([leftKey, left], [rightKey, right]) => right - left || leftKey.localeCompare(rightKey),
   );
   if (ranked.length <= maximumOutcomes) return Object.fromEntries(ranked);
   const retained = ranked.slice(0, Math.max(1, maximumOutcomes - 1));
