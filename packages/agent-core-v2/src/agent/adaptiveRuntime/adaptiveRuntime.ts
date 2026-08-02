@@ -41,6 +41,7 @@ export interface IAgentAdaptiveRuntimeService {
   promptPhase(): AdaptivePromptPhase | undefined;
   update(update: AdaptiveCounterUpdate): void;
   status(): AdaptiveStatusSnapshot | undefined;
+  reset(reason: string): void;
   complete(reason: string): void;
   fail(
     phase: Extract<
@@ -111,6 +112,10 @@ export class AgentAdaptiveRuntimeFacade implements IAgentAdaptiveRuntimeService 
 
   status(): AdaptiveStatusSnapshot | undefined {
     return this.implementation()?.status();
+  }
+
+  reset(reason: string): void {
+    this.implementationValue?.reset(reason);
   }
 
   complete(reason: string): void {
