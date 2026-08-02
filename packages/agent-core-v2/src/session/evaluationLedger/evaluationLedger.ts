@@ -4,6 +4,11 @@ import type { AdaptiveRunId, EvidenceId } from '#/agent/adaptiveRuntime/adaptive
 export type EvaluationLedgerRecordType =
   | 'adaptive.run.started'
   | 'adaptive.phase.changed'
+  | 'adaptive.session.forked'
+  | 'adaptive.session.resumed'
+  | 'adaptive.session.closed'
+  | 'adaptive.context.undone'
+  | 'adaptive.context.compacted'
   | 'baseline.captured'
   | 'request.recorded'
   | 'tool.call.recorded'
