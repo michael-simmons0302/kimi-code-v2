@@ -18,6 +18,10 @@ declare module '#/app/event/eventBus' {
       readonly runId: AdaptiveRunId;
       readonly reason: string;
     };
+    'adaptive.run.cancelled': {
+      readonly runId: AdaptiveRunId;
+      readonly reason: string;
+    };
     'adaptive.run.failed': {
       readonly runId: AdaptiveRunId;
       readonly phase: AdaptivePhase;
