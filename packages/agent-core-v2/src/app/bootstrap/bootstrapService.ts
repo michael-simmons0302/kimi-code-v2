@@ -1,13 +1,8 @@
 /**
  * `bootstrap` domain — `IBootstrapService` implementation.
- *
- * Holds the resolved startup snapshot from the seeded `IBootstrapOptions` and
- * exposes the host facts, app path layout, and top-level scope mapping. All
- * `scope(name)` values and `configKey` are computed once at construction so
- * business code can read them synchronously.
- *
- * Bound at App scope.
  */
+
+import '#/agent/adaptiveRuntime/adaptiveRegistration';
 
 import { basename, join, relative } from 'pathe';
 
@@ -68,6 +63,7 @@ export class BootstrapService implements IBootstrapService {
       cache: relative(options.homeDir, this.cacheDir),
       credentials: 'credentials',
       cron: 'cron',
+      adaptive: 'adaptive',
     };
   }
 
@@ -80,4 +76,10 @@ export class BootstrapService implements IBootstrapService {
   }
 }
 
-registerScopedService(LifecycleScope.App, IBootstrapService, BootstrapService, ScopeActivation.OnScopeCreated, 'bootstrap');
+registerScopedService(
+  LifecycleScope.App,
+  IBootstrapService,
+  BootstrapService,
+  ScopeActivation.OnScopeCreated,
+  'bootstrap',
+);

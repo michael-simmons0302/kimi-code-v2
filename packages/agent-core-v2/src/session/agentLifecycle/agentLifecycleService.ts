@@ -1,22 +1,5 @@
 /**
  * `agentLifecycle` domain — `IAgentLifecycleService` implementation.
- *
- * Creates and tracks the session's agents as child scopes in a flat registry,
- * serializing same-id bootstrap and dropping incomplete handles after startup
- * failure. Seeds each agent's identity through `agent` scopeContext, wires
- * per-agent wire records and the wire state machine, the blob store, and MCP,
- * and registers the agent in the session registry. Binds the agent id into the
- * Agent-scoped telemetry view. New logs receive a metadata
- * envelope while non-empty unversioned logs are rejected. Removal awaits the
- * agent task manager's graceful exit policy before draining turns and full
- * compaction, then disposing the child scope. Fans session-level
- * permission-mode switches out to every live agent. Bound at Session scope.
- *
- * No agent id is special here: the main agent is simply the agent created
- * with the conventional `MAIN_AGENT_ID`, and `fork` requires its source to
- * exist. The workspace's shared MCP
- * manager arrives through the seeded `ISessionMcpHandle`, whose initial
- * connect this service awaits during creation.
  */
 
 import { IInstantiationService } from '#/_base/di/instantiation';
@@ -51,8 +34,10 @@ import { IAgentToolActivationService } from '#/agent/toolActivation/toolActivati
 import { ISessionInteractionService } from '#/session/interaction/interaction';
 import { IWireService } from '#/wire/wire';
 import { ITelemetryService } from '#/app/telemetry/telemetry';
+import { IHostFileSystem } from '#/os/interface/hostFileSystem';
 import {
   type AgentListFilter,
+  type AgentPersistence,
   type CreateAgentOptions,
   type ForkAgentOptions,
   IAgentLifecycleService,
@@ -63,6 +48,8 @@ let nextAgentId = 0;
 export class AgentLifecycleService extends Disposable implements IAgentLifecycleService {
   declare readonly _serviceBrand: undefined;
   private readonly handles = new Map<string, IAgentScopeHandle>();
+  private readonly persistenceById = new Map<string, AgentPersistence>();
+  private readonly scopeById = new Map<string, string>();
   private readonly onDidCreateEmitter = this._register(new Emitter<IAgentScopeHandle>());
   private readonly onDidDisposeEmitter = this._register(new Emitter<string>());
   private readonly interactionBusDisposables = new Map<string, IDisposable>();
@@ -84,43 +71,63 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
     @ISessionMcpHandle private readonly mcpHandle: ISessionMcpHandle,
     @ISessionInteractionService private readonly interaction: ISessionInteractionService,
     @ITelemetryService private readonly telemetry: ITelemetryService,
+    @IHostFileSystem private readonly hostFs: IHostFileSystem,
   ) {
     super();
     this._register(this.onDidCreate((handle) => this.subscribeInteractionBus(handle)));
     this._register(
       this.onDidDispose((agentId) => {
-        const d = this.interactionBusDisposables.get(agentId);
-        if (d !== undefined) {
-          d.dispose();
+        const disposable = this.interactionBusDisposables.get(agentId);
+        if (disposable !== undefined) {
+          disposable.dispose();
           this.interactionBusDisposables.delete(agentId);
         }
       }),
     );
     this._register({
       dispose: () => {
-        for (const d of this.interactionBusDisposables.values()) d.dispose();
+        for (const disposable of this.interactionBusDisposables.values()) {
+          disposable.dispose();
+        }
         this.interactionBusDisposables.clear();
+        for (const [agentId, persistence] of this.persistenceById) {
+          if (persistence !== 'ephemeral') continue;
+          const scope = this.scopeById.get(agentId);
+          if (scope !== undefined) void this.removeScope(scope);
+        }
       },
     });
   }
 
   private subscribeInteractionBus(handle: IAgentScopeHandle): void {
     if (this.interactionBusDisposables.has(handle.id)) return;
-    const d = handle.accessor
+    const disposable = handle.accessor
       .get(IEventBus)
-      .subscribe('turn.ended', (e) => this.interaction.cancelPendingForTurn(e.turnId));
-    this.interactionBusDisposables.set(handle.id, d);
+      .subscribe('turn.ended', (event) => this.interaction.cancelPendingForTurn(event.turnId));
+    this.interactionBusDisposables.set(handle.id, disposable);
   }
 
   async create(opts: CreateAgentOptions = {}): Promise<IAgentScopeHandle> {
+    const persistence = opts.persistence ?? 'durable';
+    if (opts.agentId === 'main' && persistence === 'ephemeral') {
+      throw new Error('The main agent cannot use ephemeral persistence.');
+    }
     if (opts.agentId !== undefined) {
       const inflight = this.creating.get(opts.agentId);
       if (inflight !== undefined) return inflight;
       const existing = this.handles.get(opts.agentId);
-      if (existing !== undefined) return existing;
+      if (existing !== undefined) {
+        const existingPersistence = this.persistenceById.get(opts.agentId);
+        if (existingPersistence !== persistence) {
+          throw new Error(
+            `Agent ${opts.agentId} already exists with ${String(existingPersistence)} persistence.`,
+          );
+        }
+        return existing;
+      }
     }
     const agentId = opts.agentId ?? (await this.nextAvailableAgentId());
-    const promise = this.doCreate(agentId, opts);
+    const promise = this.doCreate(agentId, { ...opts, persistence });
     this.creating.set(agentId, promise);
     try {
       return await promise;
@@ -143,10 +150,18 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
     return `agent-${String(candidate)}`;
   }
 
-  private async doCreate(agentId: string, opts: CreateAgentOptions): Promise<IAgentScopeHandle> {
+  private async doCreate(
+    agentId: string,
+    opts: CreateAgentOptions & { readonly persistence: AgentPersistence },
+  ): Promise<IAgentScopeHandle> {
     const mcpReady = this.mcpHandle.ready;
-    const agentScope = this.ctx.scope(`agents/${agentId}`);
+    const agentScope = opts.persistence === 'durable'
+      ? this.ctx.scope(`agents/${agentId}`)
+      : this.ctx.scope(`adaptive/ephemeral-agents/${agentId}`);
     const agentHomedir = join(this.bootstrap.homeDir, agentScope);
+    const labels = opts.persistence === 'ephemeral'
+      ? { ...opts.labels, 'adaptive.persistence': 'ephemeral' }
+      : opts.labels;
     const handle = createScopedChildHandle(
       this.instantiation,
       LifecycleScope.Agent,
@@ -154,33 +169,43 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
       {
         extra: [
           [IAgentScopeContext, makeAgentScopeContext({ agentId, agentScope })],
-          [ITelemetryService, this.telemetry.withContext({ agent_id: agentId })],
+          [ITelemetryService, this.telemetry.withContext({
+            agent_id: agentId,
+            agent_persistence: opts.persistence,
+          })],
         ],
       },
     ) as IAgentScopeHandle;
     this.handles.set(agentId, handle);
+    this.persistenceById.set(agentId, opts.persistence);
+    this.scopeById.set(agentId, agentScope);
     try {
       const wire = handle.accessor.get(IWireService);
       await wire.seal();
-      await this.sessionMetadata.registerAgent(agentId, {
-        homedir: agentHomedir,
-        type: agentId === 'main' ? 'main' : 'sub',
-        parentAgentId: agentId === 'main' ? undefined : 'main',
-        forkedFrom: opts.forkedFrom,
-        labels: opts.labels,
-      });
+      if (opts.persistence === 'durable') {
+        await this.sessionMetadata.registerAgent(agentId, {
+          homedir: agentHomedir,
+          type: agentId === 'main' ? 'main' : 'sub',
+          parentAgentId: agentId === 'main' ? undefined : 'main',
+          forkedFrom: opts.forkedFrom,
+          labels,
+        });
+      }
       this.onDidCreateEmitter.fire(handle);
       await mcpReady;
-      await wire.restore();
+      if (opts.persistence === 'durable') await wire.restore();
       await this.bindBootstrap(handle, opts);
       await handle.accessor.get(IAgentToolActivationService).activate();
       return handle;
     } catch (error) {
       if (this.handles.get(agentId) === handle) this.handles.delete(agentId);
+      this.persistenceById.delete(agentId);
+      this.scopeById.delete(agentId);
       try {
         handle.dispose();
-      } catch { }
+      } catch {}
       this.onDidDisposeEmitter.fire(agentId);
+      if (opts.persistence === 'ephemeral') await this.removeScope(agentScope);
       throw error;
     }
   }
@@ -200,45 +225,47 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
     }
   }
 
-  async fork(sourceAgentId: string, opts?: ForkAgentOptions): Promise<IAgentScopeHandle> {
+  async fork(sourceAgentId: string, opts: ForkAgentOptions = {}): Promise<IAgentScopeHandle> {
     const source = this.handles.get(sourceAgentId);
-    if (source === undefined) throw new Error(`Source agent "${sourceAgentId}" does not exist`);
-    if (opts?.agentId !== undefined && this.handles.has(opts.agentId)) {
-      throw new Error(`Agent "${opts.agentId}" already exists`);
-    }
-    const child = await this.create({ agentId: opts?.agentId, forkedFrom: source.id });
-
-    const sourceData = source.accessor.get(IAgentProfileService).data();
-    const childProfile = child.accessor.get(IAgentProfileService);
-    const override = opts?.binding;
-    if (override?.profile !== undefined) {
-      await childProfile.bind({
-        profile: override.profile,
-        model: override.model ?? sourceData.modelAlias,
-        thinking: override?.thinking ?? sourceData.thinkingLevel,
-      });
-    } else {
-      childProfile.applyBindingSnapshot(sourceData);
-      if (override?.model !== undefined) await childProfile.setModel(override.model);
-      if (override?.thinking !== undefined) childProfile.setThinking(override.thinking);
-    }
-
-    const sourceMessages = source.accessor.get(IAgentContextMemoryService)?.get();
-    if (sourceMessages !== undefined && sourceMessages.length > 0) {
-      child.accessor.get(IAgentContextMemoryService)?.append(...sourceMessages);
-    }
-    return child;
+    if (source === undefined) throw new Error(`Agent not found: ${sourceAgentId}`);
+    const profile = source.accessor.get(IAgentProfileService).bound();
+    if (profile === undefined) throw new Error(`Agent profile is not bound: ${sourceAgentId}`);
+    const agentId = opts.agentId ?? (await this.nextAvailableAgentId());
+    const binding = {
+      ...profile,
+      ...opts.binding,
+      id: opts.binding?.id ?? profile.id,
+    };
+    const handle = await this.create({
+      agentId,
+      binding,
+      forkedFrom: sourceAgentId,
+      persistence: opts.persistence ?? 'durable',
+    });
+    const sourceContext = source.accessor.get(IAgentContextMemoryService).get();
+    handle.accessor.get(IAgentContextMemoryService).append(...sourceContext);
+    return handle;
   }
 
   get(agentId: string): IAgentScopeHandle | undefined {
     return this.handles.get(agentId);
   }
 
-  list(filter?: AgentListFilter): readonly IAgentScopeHandle[] {
-    const all = [...this.handles.values()];
-    const prefix = filter?.prefix;
-    if (prefix === undefined) return all;
-    return all.filter((handle) => handle.id.startsWith(prefix));
+  list(filter: AgentListFilter = {}): readonly IAgentScopeHandle[] {
+    return [...this.handles.values()].filter((handle) => {
+      if (filter.prefix !== undefined && !handle.id.startsWith(filter.prefix)) return false;
+      if (
+        filter.persistence !== undefined &&
+        this.persistenceById.get(handle.id) !== filter.persistence
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  persistence(agentId: string): AgentPersistence | undefined {
+    return this.persistenceById.get(agentId);
   }
 
   broadcastPermissionMode(mode: PermissionMode): void {
@@ -250,22 +277,46 @@ export class AgentLifecycleService extends Disposable implements IAgentLifecycle
   async remove(agentId: string): Promise<void> {
     const handle = this.handles.get(agentId);
     if (handle === undefined) return;
-    this.handles.delete(agentId);
-    await handle.accessor.get(IAgentTaskService).stopAllOnExit('Session closed');
-    const loop = handle.accessor.get(IAgentLoopService);
-    const compaction = handle.accessor.get(IAgentFullCompactionService).compacting;
-    const compactionSettled = compaction?.promise.catch(() => undefined) ?? Promise.resolve();
-    const reason = abortError('Agent removed');
-    for (const turnId of loop.status().pendingTurnIds) {
-      loop.cancel(turnId, reason);
+    const persistence = this.persistenceById.get(agentId) ?? 'durable';
+    const scope = this.scopeById.get(agentId);
+    const currentHandle = handle;
+    try {
+      const agentTask = currentHandle.accessor.get(IAgentTaskService);
+      await agentTask.exitGracefully({ timeoutMs: 5_000, reason: 'agent removed' });
+      currentHandle.accessor.get(IAgentLoopService).cancel(undefined, 'agent removed');
+      await currentHandle.accessor.get(IAgentLoopService).settled();
+      if (persistence === 'durable') {
+        await currentHandle.accessor.get(IAgentFullCompactionService).compactFull();
+      }
+    } catch (error) {
+      if (!abortError.is(error)) throw error;
+    } finally {
+      if (this.handles.get(agentId) === currentHandle) {
+        this.handles.delete(agentId);
+        this.persistenceById.delete(agentId);
+        this.scopeById.delete(agentId);
+        try {
+          currentHandle.dispose();
+        } finally {
+          if (persistence === 'durable') {
+            await this.sessionMetadata.removeAgent(agentId);
+          } else if (scope !== undefined) {
+            await this.removeScope(scope);
+          }
+          this.onDidDisposeEmitter.fire(agentId);
+        }
+      }
     }
-    loop.cancel(undefined, reason);
-    if (compaction !== null && !compaction.abortController.signal.aborted) {
-      compaction.abortController.abort(reason);
+  }
+
+  private async removeScope(scope: string): Promise<void> {
+    try {
+      await this.hostFs.remove(join(this.bootstrap.homeDir, scope));
+    } catch {
+      // Ephemeral cleanup is best-effort after the scope has been disposed. The
+      // private scope remains unreachable from session metadata even if the OS
+      // retains a transient file handle.
     }
-    await Promise.all([loop.settled(), compactionSettled]);
-    handle.dispose();
-    this.onDidDisposeEmitter.fire(agentId);
   }
 }
 

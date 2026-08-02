@@ -4,6 +4,7 @@ export * from './pagination';
 export * from './time';
 export * from './request-id';
 export * from './events';
+export * from './adaptive';
 export * from './display';
 export * from './ws-control';
 export * from './asyncapi';

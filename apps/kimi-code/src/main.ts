@@ -23,6 +23,10 @@ import {
 } from '@moonshot-ai/kimi-telemetry';
 
 import { createProgram } from './cli/commands';
+import {
+  loadAdaptiveRegistrations,
+  setKimiV2InvocationOverride,
+} from './cli/experimental-v2';
 import { finalizeHeadlessRun } from './cli/headless-exit';
 import type { CLIOptions } from './cli/options';
 import { OptionConflictError, validateOptions } from './cli/options';
@@ -39,14 +43,6 @@ import { cleanupStaleNativeCacheForCurrent } from './native/native-assets';
 import { installNativeModuleHook } from './native/module-hook';
 import { runNativeAssetSmokeIfRequested } from './native/smoke';
 
-/**
- * Outcome of a CLI command run, reported back to the process entrypoint.
- *
- * `handleMainCommand` is a reusable, unit-tested handler — it must not terminate
- * the process itself. It reports here whether a headless (`kimi -p`) run
- * completed so the entrypoint (the only place that owns the process) can arm the
- * force-exit fallback.
- */
 export interface MainCommandOutcome {
   readonly headlessCompleted: boolean;
 }
@@ -65,6 +61,9 @@ export async function handleMainCommand(
     }
     throw error;
   }
+
+  setKimiV2InvocationOverride(validated.options.evolve);
+  if (validated.options.evolve) await loadAdaptiveRegistrations();
 
   const preflightResult = await runUpdatePreflight(
     version,
@@ -125,6 +124,7 @@ const MIGRATE_CLI_OPTIONS: CLIOptions = {
   continue: false,
   yolo: false,
   auto: false,
+  evolve: false,
   plan: false,
   model: undefined,
   outputFormat: undefined,
@@ -137,19 +137,15 @@ const MIGRATE_CLI_OPTIONS: CLIOptions = {
 export function main(): void {
   process.title = PROCESS_NAME;
   installCrashHandlers();
-  // Route all outbound fetch through HTTP_PROXY/HTTPS_PROXY (honoring NO_PROXY)
-  // before any client is constructed. No-op when no proxy variable is set; an
-  // invalid proxy URL is reported and ignored rather than aborting startup.
   installGlobalProxyDispatcher();
   installNativeModuleHook();
   if (runNativeAssetSmokeIfRequested()) return;
 
-  // Start the background cleanup of stale native cache. Fire-and-forget; must not block startup or throw.
   queueMicrotask(() => {
     try {
       cleanupStaleNativeCacheForCurrent();
     } catch {
-      // ignore: cache GC must never affect process startup
+      // Cache GC must never affect process startup.
     }
   });
 
@@ -160,11 +156,6 @@ export function main(): void {
     (opts) => {
       void handleMainCommand(opts, version)
         .then(async (outcome) => {
-          // Only the process entrypoint disposes of the process. Print mode
-          // relies on the event loop draining to exit; flush any buffered output
-          // and then arm an unref'd fallback so a stray ref'd handle left over
-          // from the run can't wedge a completed `kimi -p` until an external
-          // timeout. A healthy run drains and exits before the fallback fires.
           if (outcome.headlessCompleted) {
             await finalizeHeadlessRun(
               process,
@@ -174,23 +165,10 @@ export function main(): void {
           }
         })
         .catch(async (error: unknown) => {
-          // Set the failure exit code synchronously, before any `await`. The
-          // terminal `process.exit(1)` below is our intended exit, but it sits
-          // behind `await logStartupFailure(...)`; by the time we reach that
-          // await, the failed run's `finally` cleanup has already torn down its
-          // ref'd handles (sockets, timers, background tasks). If the event loop
-          // drains during the await, Node exits on its own with the DEFAULT code
-          // 0 and `process.exit(1)` never runs — headless (`kimi -p`) failures
-          // would then exit 0 nondeterministically. Setting `process.exitCode`
-          // up front makes that drain-exit report failure too.
           process.exitCode = 1;
           const operation = opts.prompt !== undefined ? 'run prompt' : 'start shell';
           await logStartupFailure(operation, error);
-          process.stderr.write(
-            formatStartupError(error, {
-              operation,
-            }),
-          );
+          process.stderr.write(formatStartupError(error, { operation }));
           process.stderr.write(`See log: ${resolveGlobalLogPath(resolveKimiHome())}\n`);
           process.exit(1);
         });

@@ -5,13 +5,13 @@ import type {
   QuestionResult,
 } from '@moonshot-ai/agent-core';
 
-// Event union plus shared fields/payloads used across event families.
 export type { KimiErrorPayload, Event } from '@moonshot-ai/agent-core';
 
 export { MCP_OAUTH_AUTHORIZATION_URL_TOOL_UPDATE } from '@moonshot-ai/agent-core';
 
-// Session lifecycle/status events and their status payload.
 export type {
+  AdaptivePhase,
+  AdaptiveStatus,
   AgentStatusUpdatedEvent,
   SessionMetaUpdatedEvent,
   GoalUpdatedEvent,
@@ -22,7 +22,6 @@ export type {
   UsageStatus,
 } from '@moonshot-ai/agent-core';
 
-// Turn and step lifecycle events plus the turn-ending reason enum.
 export type {
   TurnStartedEvent,
   TurnEndedEvent,
@@ -33,14 +32,12 @@ export type {
   TurnEndReason,
 } from '@moonshot-ai/agent-core';
 
-// Streaming content and hook-result events.
 export type {
   AssistantDeltaEvent,
   HookResultEvent,
   ThinkingDeltaEvent,
 } from '@moonshot-ai/agent-core';
 
-// Tool-call events and incremental progress payloads.
 export type {
   ToolCallStartedEvent,
   ToolCallDeltaEvent,
@@ -52,7 +49,6 @@ export type {
   McpOAuthAuthorizationUrlUpdateData,
 } from '@moonshot-ai/agent-core';
 
-// MCP tool-list and server status events.
 export type {
   ToolListUpdatedEvent,
   ToolListUpdatedReason,
@@ -60,7 +56,6 @@ export type {
   McpServerStatusPayload,
 } from '@moonshot-ai/agent-core';
 
-// Approval reverse-RPC request and response/display payloads.
 export type {
   ApprovalRequest,
   ApprovalDecision,
@@ -69,7 +64,6 @@ export type {
   ToolInputDisplay,
 } from '@moonshot-ai/agent-core';
 
-// Question reverse-RPC request and answer payloads.
 export type {
   QuestionRequest,
   QuestionItem,
@@ -80,7 +74,6 @@ export type {
   QuestionResult,
 } from '@moonshot-ai/agent-core';
 
-// Subagent lifecycle events.
 export type {
   SubagentSpawnedEvent,
   SubagentStartedEvent,
@@ -89,7 +82,6 @@ export type {
   SubagentFailedEvent,
 } from '@moonshot-ai/agent-core';
 
-// Compaction lifecycle events and compaction result payload.
 export type {
   CompactionStartedEvent,
   CompactionBlockedEvent,
@@ -98,8 +90,6 @@ export type {
   CompactionResult,
 } from '@moonshot-ai/agent-core';
 
-// Background task lifecycle events emitted by the BPM. Covers both
-// bash (`bash-*`) and agent (`agent-*`) tasks under one wire format.
 export type {
   BackgroundTaskStartedEvent,
   BackgroundTaskTerminatedEvent,

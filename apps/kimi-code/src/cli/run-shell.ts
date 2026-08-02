@@ -32,7 +32,7 @@ import { restoreTerminalModes } from '#/utils/terminal-restore';
 
 import type { CLIOptions } from './options';
 import { resolveAgentProfileSelection } from './agent-selection';
-import { isKimiV2Enabled } from './experimental-v2';
+import { shouldUseKimiV2 } from './experimental-v2';
 import { createCliTelemetryBootstrap, initializeCliTelemetry } from './telemetry';
 import { createKimiCodeHostIdentity } from './version';
 
@@ -69,6 +69,7 @@ export async function runShell(
     identity: createKimiCodeHostIdentity(version),
     skillDirs: opts.skillsDirs,
     telemetry: telemetryClient,
+    adaptiveMode: opts.evolve ? 'enabled' : 'disabled',
     onOAuthRefresh: (outcome) => {
       if (outcome.success) {
         track('oauth_refresh', { outcome: 'success' });
@@ -79,12 +80,17 @@ export async function runShell(
         reason: outcome.reason,
       });
     },
-    sessionStartedProperties: { yolo: opts.yolo, auto: opts.auto, plan: opts.plan, afk: false },
+    sessionStartedProperties: {
+      yolo: opts.yolo,
+      auto: opts.auto,
+      plan: opts.plan,
+      evolve: opts.evolve,
+      afk: false,
+    },
   };
-  // Experimental agent-core-v2 route (same master switch as `kimi -p`): the
-  // harness is the SDK's v2-backed client, so the whole TUI runs on the
-  // agent-core-v2 engine.
-  const engineV2 = isKimiV2Enabled();
+  // Evolve mode requires agent-core-v2 without enabling unrelated engine
+  // experiments; the environment master switch retains its existing behavior.
+  const engineV2 = shouldUseKimiV2(opts);
   const harness = engineV2
     ? createKimiHarnessV2(harnessOptions)
     : createKimiHarness(harnessOptions);
@@ -94,6 +100,7 @@ export async function runShell(
     nodeVersion: process.version,
     platform: `${process.platform}/${process.arch}`,
     workDir,
+    evolve: opts.evolve,
   });
 
   await harness.ensureConfigFile();

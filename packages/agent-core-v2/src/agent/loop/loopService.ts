@@ -11,15 +11,17 @@
  *
  * The run drains the queue one batch per step: each batch's driver request
  * (plus any mergeable requests folded into it) materializes its context
- * messages, then one LLM step runs (`onWillBeginStep` → streamed request → content
- * parts → tool execution → `step.end` → `onDidFinishStep`). The loop itself never
- * enqueues — it only runs requests and dispatches errors. A failed step is
+ * messages, then one LLM step runs (`onWillBeginStep` → authoritative adaptive
+ * preparation → streamed request → content parts → tool execution → `step.end`
+ * → authoritative adaptive verification/reconciliation → `onDidFinishStep`).
+ * The loop itself never invents task work; adaptive continuation requests are
+ * enqueued only from explicit coordinator decisions. A failed step is
  * dispatched to the registered error handlers (first match wins); a handler
  * that claims and catches the error has already enqueued the turn's
  * continuation itself, so the loop only learns caught-or-not, while an
- * unclaimed or uncaught error fails the turn. Emits `turn.*` / delta
- * events through `event`, persists loop events through `contextMemory`, and
- * reads the step budget from `config`. The plain-data loop state
+ * unclaimed or uncaught error fails the turn. Emits `turn.*` / delta events
+ * through `event`, persists loop events through `contextMemory`, and reads the
+ * step budget from `config`. The plain-data loop state
  * (`nextReservedTurnId`, `lastRequestTraceId`, `disposing`) is registered
  * into `agentState` (`IAgentStateService`) and read/written through it;
  * `pendingTurns` and `activeTurnJob` stay plain fields because a `TurnJob`
@@ -38,6 +40,9 @@ import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/
 import { defineState } from '#/_base/state/stateRegistry';
 import { abortError, isAbortError, isUserCancellation, userCancellationReason } from '#/_base/utils/abort';
 import { toErrorMessage } from '#/_base/errors/errorMessage';
+import { IAgentAdaptiveCoordinatorService } from '#/agent/adaptiveRuntime/adaptiveCoordinator';
+import { IAgentAdaptiveFinalResponseGateService } from '#/agent/adaptiveRuntime/adaptiveFinalResponseGateService';
+import { IAgentAdaptiveRuntimeService } from '#/agent/adaptiveRuntime/adaptiveRuntime';
 import { IAgentLLMRequesterService, type AgentLLMRequestFinish } from '#/agent/llmRequester/llmRequester';
 import type { LLMRequestTrace } from '#/kosong/contract/requestTrace';
 import { IAgentToolExecutorService } from '#/agent/toolExecutor/toolExecutor';
@@ -80,6 +85,7 @@ import {
   type TurnResult,
 } from './loop';
 import {
+  ContinuationStepRequest,
   type StepRequest,
   type TurnSeed,
 } from './stepRequest';
@@ -119,6 +125,9 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
 
   constructor(
     @IAgentContextMemoryService private readonly context: IAgentContextMemoryService,
+    @IAgentAdaptiveRuntimeService private readonly adaptiveRuntime: IAgentAdaptiveRuntimeService,
+    @IAgentAdaptiveCoordinatorService private readonly adaptiveCoordinator: IAgentAdaptiveCoordinatorService,
+    @IAgentAdaptiveFinalResponseGateService private readonly adaptiveFinalResponseGate: IAgentAdaptiveFinalResponseGateService,
     @IAgentLLMRequesterService private readonly llmRequester: IAgentLLMRequesterService,
     @IEventBus private readonly eventBus: IEventBus,
     @IAgentToolExecutorService private readonly toolExecutor: IAgentToolExecutorService,
@@ -807,6 +816,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
   ): Promise<StepExecutionResult> {
     this.activeRequestTrace = undefined;
     await this.hooks.onWillBeginStep.run({ turnId, step: currentStep, signal });
+    await this.prepareAdaptiveStep(turnId, currentStep, stepUuid, signal);
     const markStepStarted = this.beginStep(turnId, signal, currentStep, stepUuid, onStarted);
     const streamParts = this.createStreamPartHandler(turnId, markStepStarted);
     const request = this.llmRequester.start(
@@ -833,6 +843,14 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       request.trace,
     );
     this.finishStep(turnId, signal, currentStep, stepUuid, response, finishReason, markStepStarted);
+    const adaptiveStopTurn = await this.reconcileAdaptiveStep(
+      turnId,
+      currentStep,
+      stepUuid,
+      signal,
+      response.usage,
+      finishReason,
+    );
     const hookStopTurn = await this.runAfterStep(
       turnId,
       signal,
@@ -840,7 +858,76 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       response.usage,
       finishReason,
     );
-    return { stopReason: finishReason, hookStopTurn };
+    return { stopReason: finishReason, hookStopTurn: adaptiveStopTurn || hookStopTurn };
+  }
+
+  private async prepareAdaptiveStep(
+    turnId: number,
+    step: number,
+    stepId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!this.adaptiveRuntime.enabled()) return;
+    if (!this.adaptiveFinalResponseGate.allowCoordinatorPreparation()) return;
+    try {
+      await this.adaptiveCoordinator.prepareStep({ turnId, step, stepId, signal });
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error;
+      this.adaptiveRuntime.fail(
+        'infrastructure-failed',
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+  }
+
+  private async reconcileAdaptiveStep(
+    turnId: number,
+    step: number,
+    stepId: string,
+    signal: AbortSignal,
+    usage: TokenUsage,
+    finishReason: FinishReason,
+  ): Promise<boolean> {
+    if (!this.adaptiveRuntime.enabled()) return false;
+    try {
+      const finalDecision = await this.adaptiveFinalResponseGate.verifyAfterStep();
+      if (finalDecision.kind === 'correction-required') {
+        this.enqueueAdaptiveContinuation('adaptive.final-response-correction');
+        return false;
+      }
+      if (finalDecision.kind === 'rejected') return true;
+      const decision = await this.adaptiveCoordinator.observeStep({
+        turnId,
+        step,
+        stepId,
+        signal,
+        usage,
+        finishReason,
+      });
+      if (decision.continueTurn) {
+        this.enqueueAdaptiveContinuation('adaptive.continue');
+      }
+      return decision.stopTurn;
+    } catch (error) {
+      if (signal.aborted || isAbortError(error)) throw error;
+      this.adaptiveRuntime.fail(
+        'infrastructure-failed',
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error;
+    }
+  }
+
+  private enqueueAdaptiveContinuation(kind: string): void {
+    this.enqueue(
+      new ContinuationStepRequest({
+        kind,
+        admission: 'activeTurnOnly',
+        mergeable: false,
+        turnScoped: true,
+      }),
+    );
   }
 
   private beginStep(

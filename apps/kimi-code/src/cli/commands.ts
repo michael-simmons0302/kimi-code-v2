@@ -48,6 +48,11 @@ export function createProgram(
     .addOption(new Option('-C').hideHelp().default(false))
     .option('-y, --yolo', 'Auto-approve regular tool calls; the agent may still ask questions.', false)
     .option('--auto', 'Start in auto permission mode: fully autonomous, the agent will not ask questions.', false)
+    .option(
+      '--evolve',
+      'Enable evaluation-guided test-time adaptation using executable causal models.',
+      false,
+    )
     .addOption(
       new Option(
         '-m, --model <model>',
@@ -155,6 +160,7 @@ export function createProgram(
       continue: raw['continue'] === true || raw['C'] === true,
       yolo: yoloValue,
       auto: autoValue,
+      evolve: raw['evolve'] === true,
       plan: raw['plan'] as boolean,
       model: raw['model'] as string | undefined,
       outputFormat: raw['outputFormat'] as CLIOptions['outputFormat'],

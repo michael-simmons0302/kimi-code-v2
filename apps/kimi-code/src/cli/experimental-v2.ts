@@ -1,22 +1,19 @@
 /**
- * Experimental agent-core-v2 engine gate for the CLI surfaces.
+ * Agent-core-v2 engine gate for the CLI surfaces.
  *
- * When the master switch `KIMI_CODE_EXPERIMENTAL_FLAG` is truthy, `kimi -p`
- * (print mode) routes to the native agent-core-v2 runner (see
- * `run-prompt.ts`) and the interactive TUI builds its harness through the
- * SDK's v2-backed client (see `run-shell.ts`), both instead of the default
- * v1 engine. The master switch also enables every experimental feature flag
- * in the engine. Read directly from the env (matching
- * `cli/update/rollout.ts`) because the CLI must not depend on the core flag
- * registry. Unset / any non-truthy value keeps the v1 path.
- *
- * Note: `kimi web` always boots kap-server (the agent-core-v2 engine
- * server) — it does not consult this switch.
+ * The master switch `KIMI_CODE_EXPERIMENTAL_FLAG` keeps its existing behavior:
+ * it routes the CLI through v2 and enables the engine's experimental features.
+ * `--evolve` also requires v2, but it must not enable unrelated experiments.
  */
 
+import type { CLIOptions } from './options';
+
 export const KIMI_V2_ENV = 'KIMI_CODE_EXPERIMENTAL_FLAG';
+export const ADAPTIVE_HOST_MODE_GLOBAL = '__KIMI_CODE_ADAPTIVE_HOST_MODE__';
 
 const TRUTHY_VALUES = new Set(['1', 'true', 'yes', 'on']);
+let invocationOverride = false;
+let adaptiveRegistrations: Promise<void> | undefined;
 
 function isTruthyEnv(
   key: string,
@@ -25,8 +22,39 @@ function isTruthyEnv(
   return TRUTHY_VALUES.has((env[key] ?? '').trim().toLowerCase());
 }
 
+/** Set once by the CLI entrypoint after option validation. */
+export function setKimiV2InvocationOverride(enabled: boolean): void {
+  invocationOverride = enabled;
+  Object.defineProperty(globalThis, ADAPTIVE_HOST_MODE_GLOBAL, {
+    value: enabled ? 'enabled' : 'disabled',
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
+}
+
+/** Load the trusted and mutable adaptive registrations before v2 scope creation. */
+export function loadAdaptiveRegistrations(): Promise<void> {
+  adaptiveRegistrations ??= (async () => {
+    await import('@moonshot-ai/agent-core-v2/agent/adaptiveRuntime/adaptiveRegistration');
+    const { ScopeActivation, withScopedRegistrationActivation } =
+      await import('@moonshot-ai/agent-core-v2/_base/di/scope');
+    await withScopedRegistrationActivation(ScopeActivation.OnDemand, async () => {
+      await import('@moonshot-ai/program-evolution/register');
+    });
+  })();
+  return adaptiveRegistrations;
+}
+
 export function isKimiV2Enabled(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
-  return isTruthyEnv(KIMI_V2_ENV, env);
+  return invocationOverride || isTruthyEnv(KIMI_V2_ENV, env);
+}
+
+export function shouldUseKimiV2(
+  options: Pick<CLIOptions, 'evolve'>,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  return options.evolve || isTruthyEnv(KIMI_V2_ENV, env);
 }

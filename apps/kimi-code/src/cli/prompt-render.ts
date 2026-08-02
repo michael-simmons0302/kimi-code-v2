@@ -1,35 +1,15 @@
 /**
- * Output rendering for `kimi -p` (print mode) — shared by the v1 driver
- * (`run-prompt.ts`) and the native v2 runner (`v2/run-v2-print.ts`).
- *
- * Both engines feed the same writer classes: v1 via the SDK `Event` stream, v2
- * via the main agent's native `IEventBus` (whose `DomainEvent` payloads are
- * already v1-protocol-shaped). Keeping the writers here lets v2 reuse them
- * without re-implementing rendering, while v1's `runPromptTurn` keeps its own
- * event-filtering / completion flow intact.
+ * Output rendering for `kimi -p` (print mode), shared by v1 and v2.
  */
 
 import type { PromptOutputFormat } from './options';
 
-/**
- * Structural hook-result shape the renderer reads. Both the v1 SDK
- * `HookResultEvent` and the v2 native `hook.result` `DomainEvent` satisfy it,
- * so the renderer stays engine-agnostic without depending on either event
- * definition.
- */
 interface HookResultEventLike {
   readonly hookEvent: string;
   readonly content: string;
   readonly blocked?: boolean;
 }
 
-/**
- * Structural retry shape the renderer reads. Mirrors the v1 SDK
- * `turn.step.retrying` event fields the stream-json meta line surfaces. Both
- * drivers forward retries to `writeRetrying`: v1 from its SDK event stream,
- * v2 from the native `turn.step.retrying` `DomainEvent` (same field names),
- * after discarding the failed attempt's partial output.
- */
 interface RetryingEventLike {
   readonly failedAttempt: number;
   readonly nextAttempt: number;
@@ -38,6 +18,19 @@ interface RetryingEventLike {
   readonly errorName: string;
   readonly errorMessage: string;
   readonly statusCode?: number;
+}
+
+export interface AdaptiveStatusEventLike {
+  readonly runId: string;
+  readonly phase: string;
+  readonly evaluationsCompleted: number;
+  readonly evaluationsActive: number;
+  readonly viableModels: number;
+  readonly openConflicts: number;
+  readonly normalizedPosteriorEntropy: number;
+  readonly decisionWeightedUncertainty: number;
+  readonly remainingBudgetFraction: number;
+  readonly verifiedCandidates: number;
 }
 
 export interface PromptOutput {
@@ -60,6 +53,7 @@ export interface PromptTurnWriter {
   ): void;
   writeToolResult(toolCallId: string, output: unknown): void;
   writeRetrying(event: RetryingEventLike): void;
+  writeAdaptiveStatus(status: AdaptiveStatusEventLike): void;
   flushAssistant(): void;
   discardAssistant(): void;
   finish(): void;
@@ -98,6 +92,21 @@ interface PromptJsonRetryMetaMessage {
   status_code?: number;
 }
 
+interface PromptJsonAdaptiveStatusMessage {
+  role: 'meta';
+  type: 'adaptive.status.updated';
+  run_id: string;
+  phase: string;
+  evaluations_completed: number;
+  evaluations_active: number;
+  viable_models: number;
+  open_conflicts: number;
+  normalized_posterior_entropy: number;
+  decision_weighted_uncertainty: number;
+  remaining_budget_fraction: number;
+  verified_candidates: number;
+}
+
 export class PromptTranscriptWriter implements PromptTurnWriter {
   private readonly assistantWriter: PromptBlockWriter;
   private readonly thinkingWriter: PromptBlockWriter;
@@ -124,15 +133,10 @@ export class PromptTranscriptWriter implements PromptTurnWriter {
   }
 
   writeToolCall(): void {}
-
   writeToolCallDelta(): void {}
-
   writeToolResult(): void {}
-
-  // Text `-p` keeps retries silent: only the failed attempt's partial assistant
-  // text is discarded (handled by the caller). No human-readable retry line is
-  // emitted, matching the prior behavior.
   writeRetrying(): void {}
+  writeAdaptiveStatus(): void {}
 
   flushAssistant(): void {
     this.assistantWriter.finish();
@@ -189,12 +193,8 @@ export class PromptJsonWriter implements PromptTurnWriter {
     argumentsPart: string | undefined,
   ): void {
     const toolCall = this.findOrCreateToolCall(toolCallId, name ?? '');
-    if (name !== undefined) {
-      toolCall.function.name = name;
-    }
-    if (argumentsPart !== undefined) {
-      toolCall.function.arguments += argumentsPart;
-    }
+    if (name !== undefined) toolCall.function.name = name;
+    if (argumentsPart !== undefined) toolCall.function.arguments += argumentsPart;
   }
 
   writeToolResult(toolCallId: string, output: unknown): void {
@@ -207,9 +207,6 @@ export class PromptJsonWriter implements PromptTurnWriter {
   }
 
   writeRetrying(event: RetryingEventLike): void {
-    // Emit a machine-readable meta line so stream-json consumers can observe
-    // provider retries. The failed attempt's partial assistant text was already
-    // discarded by the caller, so no half-formed assistant message leaks.
     const message: PromptJsonRetryMetaMessage = {
       role: 'meta',
       type: 'turn.step.retrying',
@@ -220,6 +217,24 @@ export class PromptJsonWriter implements PromptTurnWriter {
       error_name: event.errorName,
       error_message: event.errorMessage,
       status_code: event.statusCode,
+    };
+    this.writeJsonLine(message);
+  }
+
+  writeAdaptiveStatus(status: AdaptiveStatusEventLike): void {
+    const message: PromptJsonAdaptiveStatusMessage = {
+      role: 'meta',
+      type: 'adaptive.status.updated',
+      run_id: status.runId,
+      phase: status.phase,
+      evaluations_completed: status.evaluationsCompleted,
+      evaluations_active: status.evaluationsActive,
+      viable_models: status.viableModels,
+      open_conflicts: status.openConflicts,
+      normalized_posterior_entropy: status.normalizedPosteriorEntropy,
+      decision_weighted_uncertainty: status.decisionWeightedUncertainty,
+      remaining_budget_fraction: status.remainingBudgetFraction,
+      verified_candidates: status.verifiedCandidates,
     };
     this.writeJsonLine(message);
   }
@@ -260,7 +275,11 @@ export class PromptJsonWriter implements PromptTurnWriter {
   }
 
   private writeJsonLine(
-    message: PromptJsonAssistantMessage | PromptJsonToolMessage | PromptJsonRetryMetaMessage,
+    message:
+      | PromptJsonAssistantMessage
+      | PromptJsonToolMessage
+      | PromptJsonRetryMetaMessage
+      | PromptJsonAdaptiveStatusMessage,
   ): void {
     this.stdout.write(`${JSON.stringify(message)}\n`);
   }

@@ -1,37 +1,38 @@
 /**
  * `sessionExport` domain — `ISessionExportService` implementation.
- *
- * Coordinates live session flushing through the live workspace handler
- * registry, derives session paths from the handler-chain addressing, reads
- * persisted summaries through the session index, and packages diagnostic
- * files through the local zip writer. Bound at App scope.
  */
 
 import { join, resolve } from 'pathe';
 
-import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import type { ISessionScopeHandle } from '#/_base/di/scope';
+import { LifecycleScope, ScopeActivation, registerScopedService } from '#/_base/di/scope';
 import { ILogService } from '#/_base/log/log';
 import { resolveGlobalLogPath } from '#/_base/log/logConfig';
-import { IWireService } from '#/wire/wire';
 import { IBootstrapService } from '#/app/bootstrap/bootstrap';
 import { ISessionIndex, type SessionSummary } from '#/app/sessionIndex/sessionIndex';
 import { IWorkspaceLifecycleService } from '#/app/workspaceLifecycle/workspaceLifecycle';
 import { IWorkspaceService } from '#/app/workspace/workspace';
+import { ErrorCodes, Error2 } from '#/errors';
+import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle';
+import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
+import { IWireService } from '#/wire/wire';
+import { ISessionLifecycleService } from '#/workspace/sessionLifecycle/sessionLifecycle';
 import {
   sessionDirOf,
   workspacePersistenceScope,
 } from '#/workspace/sessionLifecycle/internal/addressing';
-import { ISessionLifecycleService } from '#/workspace/sessionLifecycle/sessionLifecycle';
-import { ErrorCodes, Error2 } from '#/errors';
-import { IAgentLifecycleService } from '#/session/agentLifecycle/agentLifecycle';
-import { ISessionMetadata } from '#/session/sessionMetadata/sessionMetadata';
 
+import {
+  ISessionAdaptiveExportService,
+  type AdaptiveExportPreparation,
+} from './adaptiveExport';
+import { filterAdaptiveExportFiles } from './adaptiveExportFilter';
+import { openZipSource, type ZipSource } from './file-source';
 import { buildExportManifest, type ExportSessionManifestSummary } from './manifest';
 import {
+  type ExportSessionOptions,
   type ExportSessionPayload,
   type ExportSessionResult,
-  type ExportSessionOptions,
   ISessionExportService,
 } from './sessionExport';
 import { scanSessionWire } from './wire-scan';
@@ -41,12 +42,12 @@ import {
   collectFilesRecursive,
   writeExportZip,
 } from './zip';
-import { openZipSource, type ZipSource } from './file-source';
 
 const SESSION_LOG_REL = 'logs/kimi-code.log';
 const GLOBAL_LOG_REL = 'logs/global/kimi-code.log';
 const WEB_LOG_REL = 'logs/kimi-web.jsonl';
 const DESKTOP_LOG_REL = 'logs/kimi-desktop.log';
+const ADAPTIVE_EXCLUSION_REPORT_REL = 'manifest/adaptive-export-exclusions.json';
 
 export class SessionExportService implements ISessionExportService {
   declare readonly _serviceBrand: undefined;
@@ -117,19 +118,16 @@ export class SessionExportService implements ISessionExportService {
       sessionDir,
     };
     const handle = this.liveSession(summary.id);
-    if (handle === undefined) {
-      return exportSummary;
-    }
+    if (handle === undefined) return exportSummary;
 
     try {
       const metadata = handle.accessor.get(ISessionMetadata);
       await metadata.ready;
       const meta = await metadata.read();
       exportSummary = {
+        ...exportSummary,
         id: meta.id,
         title: meta.title,
-        workspaceDir: workspace?.root,
-        sessionDir,
       };
     } catch (error) {
       this.log.warn('flushMetadata failed before export', { error });
@@ -145,7 +143,19 @@ export class SessionExportService implements ISessionExportService {
       );
     }
 
-    return exportSummary;
+    const adaptiveExport = await this.prepareAdaptiveExport(handle);
+    return { ...exportSummary, adaptiveExport };
+  }
+
+  private async prepareAdaptiveExport(
+    handle: ISessionScopeHandle,
+  ): Promise<AdaptiveExportPreparation | undefined> {
+    try {
+      return await handle.accessor.get(ISessionAdaptiveExportService).prepare();
+    } catch (error) {
+      if (isUnknownAdaptiveExportService(error)) return undefined;
+      throw error;
+    }
   }
 
   private liveSession(sessionId: string): ISessionScopeHandle | undefined {
@@ -176,6 +186,7 @@ export class SessionExportService implements ISessionExportService {
 
 export interface ExportSessionDirectorySummary extends ExportSessionManifestSummary {
   readonly sessionDir: string;
+  readonly adaptiveExport?: AdaptiveExportPreparation;
 }
 
 export async function exportSessionDirectory(input: {
@@ -214,9 +225,14 @@ export async function exportSessionDirectory(input: {
       );
     }
 
+    const filtered = filterAdaptiveExportFiles(
+      sessionDir,
+      sessionFiles,
+      input.summary.adaptiveExport,
+    );
     const sessionScan = await scanSessionWire(sessionDir, input.signal);
     const stableSessionLog = sessionLogSource;
-    const selectedSessionFiles: SessionZipEntry[] = sessionFiles.filter(
+    const selectedSessionFiles: SessionZipEntry[] = filtered.included.filter(
       (file) => file !== sessionLogPath,
     );
     if (stableSessionLog !== undefined) {
@@ -252,10 +268,27 @@ export async function exportSessionDirectory(input: {
     if (desktopSource !== undefined) {
       extras.push({ source: desktopSource, target: DESKTOP_LOG_REL });
     }
+    if (input.summary.adaptiveExport !== undefined) {
+      extras.push({
+        data: Buffer.from(
+          JSON.stringify({
+            protocol: 'adaptive-export-exclusions/1',
+            excluded: filtered.excluded,
+          }, null, 2),
+          'utf8',
+        ),
+        target: ADAPTIVE_EXCLUSION_REPORT_REL,
+      });
+    }
     const manifest = {
       ...baseManifest,
       globalLogPath: globalSource === undefined ? undefined : GLOBAL_LOG_REL,
       desktopLogPath: desktopSource === undefined ? undefined : DESKTOP_LOG_REL,
+      adaptiveExport: input.summary.adaptiveExport?.manifest,
+      adaptiveExclusionReportPath:
+        input.summary.adaptiveExport === undefined
+          ? undefined
+          : ADAPTIVE_EXCLUSION_REPORT_REL,
     };
 
     const writing = writeExportZip({
@@ -321,6 +354,11 @@ function isMissingPath(error: unknown): boolean {
     'code' in error &&
     (error as NodeJS.ErrnoException).code === 'ENOENT'
   );
+}
+
+function isUnknownAdaptiveExportService(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("unknown service 'sessionAdaptiveExportService'");
 }
 
 registerScopedService(
